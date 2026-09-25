@@ -41,7 +41,8 @@ func _store(_ k: gpu.Span<float32>, _ v: gpu.Span<float32>, _ ck: gpu.MutableSpa
 /// the keys and values so far from a Cache, and the output projection.
 /// Heads a multiple of KVHeads is grouped-query attention.
 public final class Attention {
-    public let QKV: Linear
+    /// QKV is the Q, K and V projections, as Stacked makes them.
+    public let QKV: [Linear]
     public let O: Linear
     public let Heads: int
     public let KVHeads: int
@@ -54,9 +55,11 @@ public final class Attention {
     let _v: gpu.Buffer<float32>
     let _o: gpu.Buffer<float32>
 
-    public init(qkv: Linear, o: Linear, heads: int, kvHeads: int, headDim: int, ropeBase: float32) throws {
-        if heads == 0 || kvHeads == 0 || heads % kvHeads != 0 || qkv.Out != (heads + 2 * kvHeads) * headDim || o.In != heads * headDim {
-            throw LayerError.unsupported("attention of \(heads) heads and \(kvHeads) KV heads of \(headDim), QKV to \(qkv.Out), O from \(o.In)")
+    public init(qkv: [Linear], o: Linear, heads: int, kvHeads: int, headDim: int, ropeBase: float32) throws {
+        var out = 0
+        for l in qkv { out += l.Out }
+        if heads == 0 || kvHeads == 0 || heads % kvHeads != 0 || out != (heads + 2 * kvHeads) * headDim || o.In != heads * headDim {
+            throw LayerError.unsupported("attention of \(heads) heads and \(kvHeads) KV heads of \(headDim), QKV to \(out), O from \(o.In)")
         }
         self.QKV = qkv
         self.O = o
@@ -64,8 +67,8 @@ public final class Attention {
         self.KVHeads = kvHeads
         self.HeadDim = headDim
         self.RopeBase = ropeBase
-        let d = qkv.Weight.Device
-        self._qkv = try d.CreateBuffer(of: float32.self, count: qkv.Out)
+        let d = o.Device
+        self._qkv = try d.CreateBuffer(of: float32.self, count: out)
         self._qk = _qkv.Slice(from: 0, count: (heads + kvHeads) * headDim)
         self._q = _qkv.Slice(from: 0, count: heads * headDim)
         self._k = _qkv.Slice(from: heads * headDim, count: kvHeads * headDim)
@@ -73,10 +76,10 @@ public final class Attention {
         self._o = try d.CreateBuffer(of: float32.self, count: heads * headDim)
     }
 
-    /// Fused is an Attention of separate Q, K and V weights, fused.
-    public static func Fused(q: Linear, k: Linear, v: Linear, o: Linear, heads: int, kvHeads: int, ropeBase: float32) async throws -> Attention {
-        let qkv = try Linear(try await tensor.ConcatRows([q.Weight, k.Weight, v.Weight]))
-        return try Attention(qkv: qkv, o: o, heads: heads, kvHeads: kvHeads, headDim: q.Out / heads, ropeBase: ropeBase)
+    /// Fused is an Attention of separate Q, K and V weights, stacked: one
+    /// product makes all three, and no weight is copied.
+    public static func Fused(q: Linear, k: Linear, v: Linear, o: Linear, heads: int, kvHeads: int, ropeBase: float32) throws -> Attention {
+        return try Attention(qkv: try Stacked([q, k, v]), o: o, heads: heads, kvHeads: kvHeads, headDim: q.Out / heads, ropeBase: ropeBase)
     }
 
     /// Forward attends x, the token at position, to itself and the tokens
@@ -86,7 +89,7 @@ public final class Attention {
         if position >= cache.Capacity {
             throw LayerError.unsupported("position \(position) past a cache of \(cache.Capacity)")
         }
-        try await QKV.Forward(x, into: _qkv)
+        try await nn.Forward(QKV, x, into: _qkv)
         // Q's heads and K's lie next to each other: one rotation for both.
         try await neural.RoPE(_qk, position: position, heads: Heads + KVHeads, dim: HeadDim, base: RopeBase)
         try await _store.Launch(_k, _v, cache.K, cache.V, position, cache.Capacity, HeadDim, over: _k.count)

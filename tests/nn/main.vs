@@ -84,7 +84,7 @@ for d in gputest.Devices() {
 
     // GatedMLP: Down(silu(Gate x) * Up x).
     let wg = floats(96 * 64), wu = floats(96 * 64), wd = floats(64 * 96)
-    let mlp = try await nn.GatedMLP.Fused(gate: try nn.Linear(try await weight(d, wg, [96, 64])), up: try nn.Linear(try await weight(d, wu, [96, 64])),
+    let mlp = try nn.GatedMLP.Fused(gate: try nn.Linear(try await weight(d, wg, [96, 64])), up: try nn.Linear(try await weight(d, wu, [96, 64])),
                                           down: try nn.Linear(try await weight(d, wd, [64, 96])), activation: .SiLU)
     try await mlp.Forward(try await d.Upload(x), into: row)
     let gx = matvec(wg, x, 96), ux = matvec(wu, x, 96)
@@ -102,7 +102,7 @@ for d in gputest.Devices() {
     // time with a cache, against one causal pass over all six.
     let dim = 64, heads = 8, kvHeads = 4, hd = 8, n = 6
     let wq = floats(dim * dim, 0.3), wk = floats(kvHeads * hd * dim, 0.3), wv = floats(kvHeads * hd * dim, 0.3), wo = floats(dim * dim, 0.3)
-    let att = try await nn.Attention.Fused(q: try nn.Linear(try await weight(d, wq, [dim, dim])), k: try nn.Linear(try await weight(d, wk, [kvHeads * hd, dim])),
+    let att = try nn.Attention.Fused(q: try nn.Linear(try await weight(d, wq, [dim, dim])), k: try nn.Linear(try await weight(d, wk, [kvHeads * hd, dim])),
                                            v: try nn.Linear(try await weight(d, wv, [kvHeads * hd, dim])), o: try nn.Linear(try await weight(d, wo, [dim, dim])),
                                            heads: heads, kvHeads: kvHeads, ropeBase: 10000)
     let cache = try nn.Cache(on: d, kvHeads: kvHeads, headDim: hd, capacity: 16)
