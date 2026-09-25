@@ -43,15 +43,17 @@ public struct Linear {
     public var In: int { return Weight.Shape[1] }
     public var Out: int { return Weight.Shape[0] }
 
-    /// Forward writes W·x into y: x has In elements, y Out.
-    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>) async throws {
+    /// Forward writes W·x into y: x has In elements, y Out. With
+    /// accumulate it adds W·x to what y holds: a residual connection in the
+    /// same pass.
+    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         switch Weight.DType {
         case .F32:
-            try await linalg.Gemv(try Weight.Floats(), x, into: y, m: Out, k: In)
+            try await linalg.Gemv(try Weight.Floats(), x, into: y, m: Out, k: In, accumulate: accumulate)
         case .Q4_0:
-            try await linalg.Gemv(Weight.Storage, dtype.Q4_0(), x, into: y, m: Out, k: In)
+            try await linalg.Gemv(Weight.Storage, dtype.Q4_0(), x, into: y, m: Out, k: In, accumulate: accumulate)
         case .Q8_0:
-            try await linalg.Gemv(Weight.Storage, dtype.Q8_0(), x, into: y, m: Out, k: In)
+            try await linalg.Gemv(Weight.Storage, dtype.Q8_0(), x, into: y, m: Out, k: In, accumulate: accumulate)
         default:
             throw LayerError.unsupported("a Linear of \(Weight.DType.Name)")
         }
@@ -104,29 +106,38 @@ public struct RMSNorm {
 }
 
 /// GatedMLP is Down(a(Gate·x) ⊙ Up·x): SwiGLU with .SiLU, the MLP of
-/// Llama, Mistral, Qwen and most decoders since.
+/// Llama, Mistral, Qwen and most decoders since. Gate and Up are one
+/// Linear, GateUp, their rows one after the other: one product makes both.
 public final class GatedMLP {
-    public let Gate: Linear
-    public let Up: Linear
+    public let GateUp: Linear
     public let Down: Linear
     public let Activation: neural.Activation
+    let _gateUp: gpu.Buffer<float32>
     let _gate: gpu.Buffer<float32>
     let _up: gpu.Buffer<float32>
 
-    public init(gate: Linear, up: Linear, down: Linear, activation: neural.Activation) throws {
-        self.Gate = gate
-        self.Up = up
+    public init(gateUp: Linear, down: Linear, activation: neural.Activation) throws {
+        if gateUp.Out % 2 != 0 || gateUp.Out / 2 != down.In {
+            throw LayerError.unsupported("a GatedMLP's gate and up of \(gateUp.Out) rows, and down from \(down.In)")
+        }
+        self.GateUp = gateUp
         self.Down = down
         self.Activation = activation
-        let d = gate.Weight.Device
-        self._gate = try d.CreateBuffer(of: float32.self, count: gate.Out)
-        self._up = try d.CreateBuffer(of: float32.self, count: up.Out)
+        let hidden = gateUp.Out / 2
+        self._gateUp = try gateUp.Weight.Device.CreateBuffer(of: float32.self, count: gateUp.Out)
+        self._gate = _gateUp.Slice(from: 0, count: hidden)
+        self._up = _gateUp.Slice(from: hidden, count: hidden)
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>) async throws {
-        try await Gate.Forward(x, into: _gate)
-        try await Up.Forward(x, into: _up)
+    /// Fused is a GatedMLP of separate gate and up weights, fused.
+    public static func Fused(gate: Linear, up: Linear, down: Linear, activation: neural.Activation) async throws -> GatedMLP {
+        return try GatedMLP(gateUp: try Linear(try await tensor.ConcatRows([gate.Weight, up.Weight])), down: down, activation: activation)
+    }
+
+    /// Forward writes the MLP of x into y, or with accumulate adds it.
+    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+        try await GateUp.Forward(x, into: _gateUp)
         try await neural.Gated(_up, gate: _gate, Activation, into: _up)
-        try await Down.Forward(_up, into: y)
+        try await Down.Forward(_up, into: y, accumulate: accumulate)
     }
 }
