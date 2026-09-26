@@ -11,11 +11,13 @@
 // them (proposed_ai_packages.md §6.2).
 package nn
 
-import "gpu"
-import "gpu/dtype"
-import "gpu/linalg"
-import "gpu/neural"
-import "tensor"
+import (
+    "gpu"
+    "gpu/dtype"
+    "gpu/linalg"
+    "gpu/neural"
+    "tensor"
+)
 
 /// LayerError is a layer given what it cannot take.
 public enum LayerError: Error {
@@ -28,8 +30,9 @@ public enum LayerError: Error {
     }
 }
 
-/// Linear is y = W·x, W a [out, in] weight: float32, or q4_0, q8_0, q4_K
-/// or q6_K blocks decoded in place as the product is taken. W may be stacked from
+/// Linear is y = W·x, W a [out, in] weight: float32, float16 or bfloat16,
+/// or q4_0, q8_0, q4_K or q6_K blocks, decoded in place as the product is
+/// taken. W may be stacked from
 /// up to three weights of the same format and input -- a model's Q, K and V
 /// projections, or gate and up -- which one product computes together,
 /// with no copy of the weights made.
@@ -73,6 +76,10 @@ public struct Linear {
             var floats: [gpu.Buffer<float32>] = []
             for p in Parts { floats.append(try p.Floats()) }
             try await linalg.Gemv(floats, rows: rows, x, into: y, k: In, accumulate: accumulate)
+        case .F16:
+            try await linalg.Gemv(Parts.map { $0.Storage }, rows: rows, dtype.F16(), x, into: y, k: In, accumulate: accumulate)
+        case .BF16:
+            try await linalg.Gemv(Parts.map { $0.Storage }, rows: rows, dtype.BF16(), x, into: y, k: In, accumulate: accumulate)
         case .Q4_0:
             try await linalg.Gemv(Parts.map { $0.Storage }, rows: rows, dtype.Q4_0(), x, into: y, k: In, accumulate: accumulate)
         case .Q8_0:
@@ -120,7 +127,7 @@ public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, into y: gpu.B
 }
 
 /// Embedding is a table of vectors, one a token: a [count, dim] weight,
-/// float32 or block-quantized.
+/// float32, a half type or block-quantized.
 public struct Embedding {
     public let Weight: tensor.Tensor
 
@@ -139,6 +146,10 @@ public struct Embedding {
         switch Weight.DType {
         case .F32:
             try await x.Copy(from: try Weight.Floats().Slice(from: token * Dim, count: Dim))
+        case .F16:
+            try await dtype.Dequantize(Weight.Storage, dtype.F16(), at: at, count: Dim, into: x)
+        case .BF16:
+            try await dtype.Dequantize(Weight.Storage, dtype.BF16(), at: at, count: Dim, into: x)
         case .Q4_0:
             try await dtype.Dequantize(Weight.Storage, dtype.Q4_0(), at: at, count: Dim, into: x)
         case .Q8_0:

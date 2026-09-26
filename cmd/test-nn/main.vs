@@ -3,13 +3,15 @@
 // against one causal pass over all the tokens with no cache.
 package main
 
-import "gpu"
-import "gpu/attention"
-import "gpu/linalg"
-import "gpu/neural"
-import "gpu/gputest"
-import "nn"
-import "tensor"
+import (
+    "gpu"
+    "gpu/attention"
+    "gpu/gputest"
+    "gpu/linalg"
+    "gpu/neural"
+    "nn"
+    "tensor"
+)
 
 @_silgen_name("exp") func cExp(_ x: float64) -> float64
 
@@ -104,7 +106,7 @@ for d in gputest.Devices() {
     let wq = floats(dim * dim, 0.3), wk = floats(kvHeads * hd * dim, 0.3), wv = floats(kvHeads * hd * dim, 0.3), wo = floats(dim * dim, 0.3)
     let att = try nn.Attention.Fused(q: try nn.Linear(try await weight(d, wq, [dim, dim])), k: try nn.Linear(try await weight(d, wk, [kvHeads * hd, dim])),
                                            v: try nn.Linear(try await weight(d, wv, [kvHeads * hd, dim])), o: try nn.Linear(try await weight(d, wo, [dim, dim])),
-                                           heads: heads, kvHeads: kvHeads, ropeBase: 10000)
+                                           heads: heads, kvHeads: kvHeads, rope: nn.Rope(base: 10000, layout: .halves))
     let cache = try nn.Cache(on: d, kvHeads: kvHeads, headDim: hd, capacity: 16)
     let xs = floats(n * dim)
     var stepped: [float32] = []
@@ -123,8 +125,8 @@ for d in gputest.Devices() {
     }
     let qb2 = try await d.Upload(q), kb2 = try await d.Upload(k)
     let positions = try await d.Upload((0..<n).map { int32($0) })
-    try await neural.RoPE(qb2, positions: positions, heads: heads, dim: hd)
-    try await neural.RoPE(kb2, positions: positions, heads: kvHeads, dim: hd)
+    try await neural.RoPE(qb2, positions: positions, heads: heads, dim: hd, layout: .halves)
+    try await neural.RoPE(kb2, positions: positions, heads: kvHeads, dim: hd, layout: .halves)
     func headsFirst(_ a: [float32], _ hs: int) -> [float32] {
         var out = [float32](repeating: 0, count: a.count)
         for t in 0..<n { for hh in 0..<hs { for c in 0..<hd { out[(hh * n + t) * hd + c] = a[(t * hs + hh) * hd + c] } } }

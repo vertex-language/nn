@@ -1,10 +1,12 @@
 // Attention, with the KV cache decoding keeps between tokens.
 package nn
 
-import "gpu"
-import "gpu/attention"
-import "gpu/neural"
-import "tensor"
+import (
+    "gpu"
+    "gpu/attention"
+    "gpu/neural"
+    "tensor"
+)
 
 /// Cache is the keys and values of the tokens so far, for one layer:
 /// [kvHeads, capacity, headDim] each, the first Count rows of a head used.
@@ -35,6 +37,19 @@ func _store(_ k: gpu.Span<float32>, _ v: gpu.Span<float32>, _ ck: gpu.MutableSpa
     }
 }
 
+/// Rope is how an Attention turns its queries and keys by position: the
+/// frequency base, and which elements of a head pair up -- a property of
+/// the checkpoint's Q and K weights (neural.RopeLayout).
+public struct Rope {
+    public var Base: float32
+    public var Layout: neural.RopeLayout
+
+    public init(base: float32 = 10000, layout: neural.RopeLayout = .halves) {
+        self.Base = base
+        self.Layout = layout
+    }
+}
+
 /// Attention is a transformer's self-attention for one token at a time:
 /// the Q, K and V projections -- one Linear, QKV, their rows one after the
 /// other, so one product makes all three -- rotary position embeddings,
@@ -47,7 +62,7 @@ public final class Attention {
     public let Heads: int
     public let KVHeads: int
     public let HeadDim: int
-    public let RopeBase: float32
+    public let Rope: Rope
     let _qkv: gpu.Buffer<float32>
     let _qk: gpu.Buffer<float32>
     let _q: gpu.Buffer<float32>
@@ -55,7 +70,7 @@ public final class Attention {
     let _v: gpu.Buffer<float32>
     let _o: gpu.Buffer<float32>
 
-    public init(qkv: [Linear], o: Linear, heads: int, kvHeads: int, headDim: int, ropeBase: float32) throws {
+    public init(qkv: [Linear], o: Linear, heads: int, kvHeads: int, headDim: int, rope: Rope) throws {
         var out = 0
         for l in qkv { out += l.Out }
         if heads == 0 || kvHeads == 0 || heads % kvHeads != 0 || out != (heads + 2 * kvHeads) * headDim || o.In != heads * headDim {
@@ -66,7 +81,7 @@ public final class Attention {
         self.Heads = heads
         self.KVHeads = kvHeads
         self.HeadDim = headDim
-        self.RopeBase = ropeBase
+        self.Rope = rope
         let d = o.Device
         self._qkv = try d.CreateBuffer(of: float32.self, count: out)
         self._qk = _qkv.Slice(from: 0, count: (heads + kvHeads) * headDim)
@@ -78,8 +93,8 @@ public final class Attention {
 
     /// Fused is an Attention of separate Q, K and V weights, stacked: one
     /// product makes all three, and no weight is copied.
-    public static func Fused(q: Linear, k: Linear, v: Linear, o: Linear, heads: int, kvHeads: int, ropeBase: float32) throws -> Attention {
-        return try Attention(qkv: try Stacked([q, k, v]), o: o, heads: heads, kvHeads: kvHeads, headDim: q.Out / heads, ropeBase: ropeBase)
+    public static func Fused(q: Linear, k: Linear, v: Linear, o: Linear, heads: int, kvHeads: int, rope: Rope) throws -> Attention {
+        return try Attention(qkv: try Stacked([q, k, v]), o: o, heads: heads, kvHeads: kvHeads, headDim: q.Out / heads, rope: rope)
     }
 
     /// Forward attends x, the token at position, to itself and the tokens
@@ -91,7 +106,7 @@ public final class Attention {
         }
         try await nn.Forward(QKV, x, into: _qkv)
         // Q's heads and K's lie next to each other: one rotation for both.
-        try await neural.RoPE(_qk, position: position, heads: Heads + KVHeads, dim: HeadDim, base: RopeBase)
+        try await neural.RoPE(_qk, position: position, heads: Heads + KVHeads, dim: HeadDim, base: Rope.Base, layout: Rope.Layout)
         try await _store.Launch(_k, _v, cache.K, cache.V, position, cache.Capacity, HeadDim, over: _k.count)
         let shape = attention.Shape(heads: Heads, kvHeads: KVHeads, queries: 1, keys: position + 1,
                                     headDim: HeadDim, keyCapacity: cache.Capacity)
