@@ -351,9 +351,7 @@ public final class MoE: nn.FFN {
     }
 }
 
-/// _Work is a MoE's buffers by slot, grown to the most needed: apart from
-/// Forward because the compiler's SIL verifier rejects CreateBuffer
-/// specialized inside a branch of an async function.
+/// _Work is a MoE's buffers by slot, grown to the most needed.
 final class _Work {
     var _bufs: [gpu.Buffer<float32>] = []
     var _have: [bool] = []
@@ -373,9 +371,7 @@ final class _Work {
 
     func Ids(_ d: gpu.Device, _ count: int) throws -> gpu.Buffer<int32> {
         if _ids == nil || _ids!.count < count {
-            // A float's bytes viewed as ints: CreateBuffer(of: int32.self)
-            // specialized here fails the compiler's SIL verifier.
-            _ids = try d.CreateBuffer(of: float32.self, count: max(count, 1)).View(as: int32.self)
+            _ids = try d.CreateBuffer(of: int32.self, count: max(count, 1))
         }
         return _ids!.Slice(from: 0, count: count)
     }
