@@ -50,6 +50,9 @@ public struct Spec {
     /// NoRopeEvery is n where every n-th layer (1-based) does not turn
     /// (SmolLM3's 4); 0 for none.
     public var NoRopeEvery: int = 0
+    /// RopeSlidingOnly is whether, in a model with sliding-window layers,
+    /// only those turn and the full layers do not (EXAONE 4's).
+    public var RopeSlidingOnly: bool = false
     public var Norm: nn.NormKind = .rms
     /// NormBias is whether the block and final norms read a bias.
     public var NormBias: bool = false
@@ -201,8 +204,9 @@ public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async thr
     var blocks: [Block] = []
     for i in 0..<h.Layers {
         let g = "blk.\(i)."
-        let noRope = s.Rope == .none || (s.NoRopeEvery > 0 && (i + 1) % s.NoRopeEvery == 0)
         let sliding = swa.window > 0 && swa.layers[i]
+        let noRope = s.Rope == .none || (s.NoRopeEvery > 0 && (i + 1) % s.NoRopeEvery == 0)
+            || (s.RopeSlidingOnly && swa.window > 0 && !sliding)
         let rope = nn.Rope(base: sliding ? swaBase : h.RopeBase, layout: layout,
                            dims: noRope ? -1 : (h.RotaryDims == h.HeadDim ? 0 : h.RotaryDims))
         let attention = try nn.Attention(
@@ -343,7 +347,8 @@ public func MRope(_ ck: model.Checkpoint) -> bool {
 /// (gate absent for ungated experts), {arch}.expert_used_count of them a
 /// token, {arch}.expert_weights_scale; and with shared, the shared expert
 /// ffn_{gate,up,down}_shexp added to every token's, behind its gate
-/// ffn_gate_inp_shexp where it has one.
+/// ffn_gate_inp_shexp where it has one. With expertScales the experts' and
+/// the shared expert's ".scale"s apply.
 public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating: moe.Gating, norm: bool, expertScales: bool,
                       activation: neural.Activation, shared: bool) async throws -> nn.FFN {
     func experts(_ name: string) async throws -> moe.Experts {
@@ -354,25 +359,20 @@ public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating:
         return try moe.Experts(try await w.Tensor(g + name + ".weight", g + name + ".weight"), scales: scales)
     }
     let router = try await w.Linear(g + "ffn_gate_inp", g + "ffn_gate_inp", bias: false, scale: false)
-    var gate: moe.Experts? = nil
-    if w.Has(g + "ffn_gate_exps.weight", g + "ffn_gate_exps.weight") {
-        gate = try await experts("ffn_gate_exps")
-    }
     let used = ck.Config.Int("num_experts_per_tok") ?? 2
-    let m = try moe.MoE(router: router, gate: gate, up: try await experts("ffn_up_exps"), down: try await experts("ffn_down_exps"),
-                        used: used)
+    let m = try await _mixture(w, g, router, used, experts)
     m.Gating = gating
     m.NormWeights = norm
     m.WeightScale = Key(ck, "expert_weights_scale")
     m.Activation = activation
-    if w.Has(g + "exp_probs_b.bias", g + "exp_probs_b.bias") {
-        m.SelectionBias = try await w.Floats(g + "exp_probs_b.bias", g + "exp_probs_b.bias")
+    for name in ["exp_probs_b.bias", "exp_probs_b"] where m.SelectionBias == nil && w.Has(g + name, g + name) {
+        m.SelectionBias = try await w.Floats(g + name, g + name)
     }
     if shared && w.Has(g + "ffn_up_shexp.weight", g + "ffn_up_shexp.weight") {
         let s = try nn.GatedMLP.Fused(
-            gate: try await w.Linear(g + "ffn_gate_shexp", g + "ffn_gate_shexp", bias: false, scale: false),
-            up: try await w.Linear(g + "ffn_up_shexp", g + "ffn_up_shexp", bias: false, scale: false),
-            down: try await w.Linear(g + "ffn_down_shexp", g + "ffn_down_shexp", bias: false, scale: false),
+            gate: try await w.Linear(g + "ffn_gate_shexp", g + "ffn_gate_shexp", bias: false, scale: expertScales),
+            up: try await w.Linear(g + "ffn_up_shexp", g + "ffn_up_shexp", bias: false, scale: expertScales),
+            down: try await w.Linear(g + "ffn_down_shexp", g + "ffn_down_shexp", bias: false, scale: expertScales),
             activation: activation)
         // Qwen2-MoE's shared expert is gated, a sigmoid a token.
         if w.Has(g + "ffn_gate_inp_shexp.weight", g + "ffn_gate_inp_shexp.weight") {
@@ -384,6 +384,22 @@ public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating:
         return Sum([m, s])
     }
     return m
+}
+
+// _mixture is the experts of a MixtureOf: gate and up apart, or one
+// weight (ffn_gate_up_exps, HY V3's).
+func _mixture(_ w: Weights, _ g: string, _ router: nn.Linear, _ used: int,
+              _ experts: (string) async throws -> moe.Experts) async throws -> moe.MoE {
+    if w.Has(g + "ffn_gate_up_exps.weight", g + "ffn_gate_up_exps.weight") {
+        return try moe.MoE(router: router, gateUp: try await experts("ffn_gate_up_exps"), down: try await experts("ffn_down_exps"),
+                           used: used)
+    }
+    var gate: moe.Experts? = nil
+    if w.Has(g + "ffn_gate_exps.weight", g + "ffn_gate_exps.weight") {
+        gate = try await experts("ffn_gate_exps")
+    }
+    return try moe.MoE(router: router, gate: gate, up: try await experts("ffn_up_exps"), down: try await experts("ffn_down_exps"),
+                       used: used)
 }
 
 /// Sum is FFNs of one input whose outputs add: a mixture and its shared

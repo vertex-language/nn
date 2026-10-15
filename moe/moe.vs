@@ -187,6 +187,23 @@ func _gatedExperts(_ g: gpu.MutableSpan<float32>, _ u: gpu.Span<float32>, _ a: i
     }
 }
 
+func _gatedFused(_ act: gpu.MutableSpan<float32>, _ gu: gpu.Span<float32>, _ a: int32, _ limit: float32, _ hidden: int, _ n: int) kernel {
+    // a(gate)·up from one product a row: an item's gate its first hidden
+    // values, its up the next (ffn_gate_up_exps), into act's row.
+    let i = gpu.Index.x
+    if i < n {
+        let r = i / hidden
+        let j = i - r * hidden
+        var up = gu[r * 2 * hidden + hidden + j]
+        var g = neural.Apply(a, gu[r * 2 * hidden + j])
+        if limit > 0 {
+            up = math.Max(-limit, math.Min(limit, up))
+            g = math.Min(limit, g)
+        }
+        act[i] = g * up
+    }
+}
+
 func _combine(_ d: gpu.Span<float32>, _ w: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ dim: int, _ used: int, _ n: int,
               _ accumulate: bool) kernel {
     // Token t's output: its experts' rows weighted and added, in the order
@@ -247,11 +264,13 @@ public struct Experts {
 
 /// MoE is the sparse feed-forward network: a router (a Linear to one
 /// logit an expert), the gating, Used experts chosen a token, and the
-/// experts' gate, up and down -- gate nil for an ungated one.
+/// experts' gate, up and down -- gate nil for an ungated one -- or their
+/// gate and up as one weight (GateUp, Up then the same).
 public final class MoE: nn.FFN {
     public let Router: nn.Linear
     public let Gate: Experts?
     public let Up: Experts
+    public let GateUp: Experts?
     public let Down: Experts
     public let Used: int
     public var Gating: Gating = .softmax
@@ -277,6 +296,23 @@ public final class MoE: nn.FFN {
         self.Router = router
         self.Gate = gate
         self.Up = up
+        self.GateUp = nil
+        self.Down = down
+        self.Used = used
+        self._ws = _Work()
+    }
+
+    /// init(gateUp:) is a mixture whose experts' gate and up are one
+    /// weight of twice their rows, the gate's first.
+    public init(router: nn.Linear, gateUp: Experts, down: Experts, used: int) throws {
+        let e = gateUp.Count
+        if router.Out != e || down.Count != e || used < 1 || used > e || e > 1024 || gateUp.Rows % 2 != 0 {
+            throw MoEError.unsupported("\(e) experts of \(gateUp.Rows) gate and up rows, \(used) used, a router to \(router.Out)")
+        }
+        self.Router = router
+        self.Gate = nil
+        self.Up = gateUp
+        self.GateUp = gateUp
         self.Down = down
         self.Used = used
         self._ws = _Work()
@@ -287,7 +323,7 @@ public final class MoE: nn.FFN {
     public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         let d = Router.Device
         let e = Experts, k = Used
-        let hidden = Up.Rows
+        let hidden = GateUp != nil ? Up.Rows / 2 : Up.Rows
         let dim = Down.Rows
         let logits = try _ws.Floats(d, 0, n * e)
         try await Router.Forward(x, rows: n, into: logits)
@@ -296,13 +332,19 @@ public final class MoE: nn.FFN {
         let bias = SelectionBias ?? logits
         try await _route.Launch(logits, bias, ids, weights, e, k, Gating._code, SelectionBias != nil, NormWeights, WeightScale,
                                 over: n * 64, workgroup: 64)
-        let up = try _ws.Floats(d, 2, n * k * hidden)
-        try await Up.Forward(x, ids: ids, items: n * k, xShared: k, into: up)
         let act = try _ws.Floats(d, 3, n * k * hidden)
-        if let g = Gate {
-            try await g.Forward(x, ids: ids, items: n * k, xShared: k, into: act)
+        if let gu = GateUp {
+            let both = try _ws.Floats(d, 2, n * k * 2 * hidden)
+            try await gu.Forward(x, ids: ids, items: n * k, xShared: k, into: both)
+            try await _gatedFused.Launch(act, both, Activation._code, Clamp, hidden, n * k * hidden, over: n * k * hidden)
+        } else {
+            let up = try _ws.Floats(d, 2, n * k * hidden)
+            try await Up.Forward(x, ids: ids, items: n * k, xShared: k, into: up)
+            if let g = Gate {
+                try await g.Forward(x, ids: ids, items: n * k, xShared: k, into: act)
+            }
+            try await _gatedExperts.Launch(act, up, Activation._code, Gate != nil, Clamp, n * k * hidden, over: n * k * hidden)
         }
-        try await _gatedExperts.Launch(act, up, Activation._code, Gate != nil, Clamp, n * k * hidden, over: n * k * hidden)
         let down = try _ws.Floats(d, 4, n * k * dim)
         try await Down.Forward(act, ids: ids, items: n * k, xShared: 1, into: down)
         try await _combine.Launch(down, weights, y, dim, k, n, accumulate, over: ((dim + 63) / 64 * 64, n, 1), workgroup: (64, 1, 1))
