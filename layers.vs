@@ -415,7 +415,7 @@ func _gatedRows(_ gu: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ a: int
 /// GatedMLP is Down(a(Gate·x) ⊙ Up·x): SwiGLU with .SiLU, the MLP of
 /// Llama, Mistral, Qwen and most decoders since. Gate and Up are one
 /// Linear, GateUp, their rows one after the other: one product makes both.
-public final class GatedMLP {
+public final class GatedMLP: FFN {
     /// GateUp is the gate and up projections, as Stacked makes them.
     public let GateUp: [Linear]
     public let Down: Linear
