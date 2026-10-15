@@ -91,9 +91,6 @@ public struct Config {
             if let rope = c.Int("rope_dimension_count", gguf: "rope.dimension_count"), rope != cfg.HeadDim {
                 throw LoadError.unsupported("rotary embeddings over \(rope) of a head's \(cfg.HeadDim) dimensions")
             }
-            if let experts = c.Int("num_experts"), experts > 0 {
-                throw LoadError.unsupported("a mixture of \(experts) experts (Mixtral's) is not run yet")
-            }
             if cfg.Vocab == 0, let t = ck.Info("model.embed_tokens.weight") {
                 cfg.Vocab = t.Shape[0]
             }
@@ -148,15 +145,25 @@ public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decod
             o: try await w.Linear(p + "self_attn.o_proj", g + "attn_output"),
             heads: c.Heads, kvHeads: c.KVHeads, headDim: c.HeadDim, rope: rope)
         attention.Table = table
-        let mlp = try nn.GatedMLP.Fused(
-            gate: try await w.Linear(p + "mlp.gate_proj", g + "ffn_gate", biasFirst: true),
-            up: try await w.Linear(p + "mlp.up_proj", g + "ffn_up", biasFirst: true),
-            down: try await w.Linear(p + "mlp.down_proj", g + "ffn_down", biasFirst: true),
-            activation: .SiLU)
+        let mlp = try await _ffn(w, ck, p, g)
         blocks.append(decoder.Standard(attnNorm: try await w.RMS(p + "input_layernorm", c.Eps), attention: attention,
                                        ffnNorm: try await w.RMS(p + "post_attention_layernorm", c.Eps), ffn: mlp))
     }
     let output = c.TiedEmbeddings ? try nn.Linear(embed.Weight) : try await w.Linear("lm_head", "output")
     return decoder.Network(on: d, dim: c.Dim, context: c.Context, embed: embed, blocks: blocks, kvHeads: c.KVHeads,
                            headDim: c.HeadDim, norm: try await w.RMS("model.norm", c.Eps), output: output)
+}
+
+// _ffn is layer p's (g's in a GGUF) MLP: Mixtral's mixture of experts
+// where the layer has a router.
+func _ffn(_ w: decoder.Weights, _ ck: model.Checkpoint, _ p: string, _ g: string) async throws -> nn.FFN {
+    if w.Has(p + "block_sparse_moe.gate.weight", g + "ffn_gate_inp.weight") {
+        return try await decoder.MixtureOf(w, g, ck, gating: .softmax, norm: true, expertScales: true, activation: .SiLU,
+                                           shared: false)
+    }
+    return try nn.GatedMLP.Fused(
+        gate: try await w.Linear(p + "mlp.gate_proj", g + "ffn_gate", biasFirst: true),
+        up: try await w.Linear(p + "mlp.up_proj", g + "ffn_up", biasFirst: true),
+        down: try await w.Linear(p + "mlp.down_proj", g + "ffn_down", biasFirst: true),
+        activation: .SiLU)
 }

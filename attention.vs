@@ -108,6 +108,14 @@ func _ropeRows(_ qkv: gpu.MutableSpan<float32>, _ cos: gpu.Span<float32>, _ sin:
     x[ib] = a * s + b * c
 }
 
+func _clampRows(_ x: gpu.MutableSpan<float32>, _ c: float32, _ n: int) kernel {
+    // Each value within ±c.
+    let i = gpu.Index.x
+    if i < n {
+        x[i] = math.Max(-c, math.Min(c, x[i]))
+    }
+}
+
 func _segmentNorm(_ x: gpu.MutableSpan<float32>, _ w: gpu.Span<float32>, _ b: gpu.Span<float32>, _ hasBias: bool, _ layer: bool,
                   _ width: int, _ offset: int, _ len: int, _ segs: int, _ shared: bool, _ eps: float32) kernel {
     // A workgroup a segment: elements offset + s·len ..< + len of row r of
@@ -228,6 +236,9 @@ public final class Attention {
     /// Window, when above 0, is a sliding window: a query sees itself and
     /// the Window - 1 keys before it.
     public var Window: int = 0
+    /// Clamp, when above 0, bounds the projected queries, keys and values
+    /// to ±Clamp (llama.cpp's clamp_kqv: DBRX's).
+    public var Clamp: float32 = 0
     /// Table is the cosines and sines the rotation is read from: a model
     /// gives its layers one to share; one without is made at the first
     /// Forward.
@@ -318,6 +329,9 @@ public final class Attention {
         let qkv = _qkv!.Slice(from: 0, count: n * (hd + 2 * KVHeads * HeadDim))
         let qh = _q!, oh = _o!, merged = _merged!
         try await nn.Forward(QKV, x, rows: n, into: qkv)
+        if Clamp > 0 {
+            try await _clampRows.Launch(qkv, Clamp, qkv.count, over: qkv.count)
+        }
         if !NormAfterRope {
             try await _norm(qkv, rows: n, QNorm, first: 0, heads: Heads)
             try await _norm(qkv, rows: n, KNorm, first: Heads, heads: KVHeads)

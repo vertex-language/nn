@@ -1,6 +1,7 @@
 // Package qwen is the Qwen network, every generation of it llama.cpp
-// runs that is dense attention so far: Qwen (1), Qwen2 and Qwen2.5 (QKV
-// biases), and Qwen3 (QK-norm). Each generation is its own Config kind;
+// runs that is full attention so far: Qwen (1), Qwen2 and Qwen2.5 (QKV
+// biases), Qwen3 (QK-norm), and their mixtures of experts, Qwen2-MoE (a
+// gated shared expert) and Qwen3-MoE. Each generation is its own Config kind;
 // the blocks are nn/decoder's, with what each generation's graph in
 // llama.cpp reads and nothing it does not.
 //
@@ -33,11 +34,19 @@ public enum Generation: Equatable {
     case qwen
     case qwen2
     case qwen3
+    case qwen2moe
+    case qwen3moe
+
+    /// QKNorm is whether the generation norms queries' and keys' heads.
+    public var QKNorm: bool { return self == .qwen3 || self == .qwen3moe }
+    /// Experts is whether its layers are mixtures of experts.
+    public var Experts: bool { return self == .qwen2moe || self == .qwen3moe }
 }
 
 /// Names are the architecture names this network loads: Hugging Face's and
 /// GGUF's.
-public let Names = ["QWenLMHeadModel", "qwen", "Qwen2ForCausalLM", "Qwen2Model", "qwen2", "Qwen3ForCausalLM", "Qwen3Model", "qwen3"]
+public let Names = ["QWenLMHeadModel", "qwen", "Qwen2ForCausalLM", "Qwen2Model", "qwen2", "Qwen3ForCausalLM", "Qwen3Model", "qwen3",
+                    "Qwen2MoeForCausalLM", "qwen2moe", "Qwen3MoeForCausalLM", "qwen3moe"]
 
 /// GenerationOf is the generation an architecture name is, or nil.
 public func GenerationOf(_ arch: string) -> Generation? {
@@ -45,6 +54,8 @@ public func GenerationOf(_ arch: string) -> Generation? {
     case "QWenLMHeadModel", "qwen": return .qwen
     case "Qwen2ForCausalLM", "Qwen2Model", "qwen2": return .qwen2
     case "Qwen3ForCausalLM", "Qwen3Model", "qwen3": return .qwen3
+    case "Qwen2MoeForCausalLM", "qwen2moe": return .qwen2moe
+    case "Qwen3MoeForCausalLM", "qwen3moe": return .qwen3moe
     default: return nil
     }
 }
@@ -76,7 +87,7 @@ public struct Config {
         }
         let dim = try need("hidden_size")
         let heads = try need("num_attention_heads")
-        if let experts = c.Int("num_experts"), experts > 0 {
+        if let experts = c.Int("num_experts"), experts > 0, !g.Experts {
             throw LoadError.unsupported("a mixture of \(experts) experts is not run yet")
         }
         return Config(
@@ -112,17 +123,11 @@ public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decod
             o: try await w.Linear(p + "self_attn.o_proj", g + "attn_output", bias: c.Generation != .qwen),
             heads: c.Heads, kvHeads: c.KVHeads, headDim: c.HeadDim, rope: rope)
         attention.Table = table
-        if c.Generation == .qwen3 {
+        if c.Generation.QKNorm {
             attention.QNorm = nn.HeadNorm(try await w.RMS(p + "self_attn.q_norm", c.Eps, gg: g + "attn_q_norm"))
             attention.KNorm = nn.HeadNorm(try await w.RMS(p + "self_attn.k_norm", c.Eps, gg: g + "attn_k_norm"))
         }
-        // The MLP's biases never, and its scales only in Qwen3's graph.
-        let s = c.Generation == .qwen3
-        let mlp = try nn.GatedMLP.Fused(
-            gate: try await w.Linear(p + "mlp.gate_proj", g + "ffn_gate", bias: false, scale: s),
-            up: try await w.Linear(p + "mlp.up_proj", g + "ffn_up", bias: false, scale: s),
-            down: try await w.Linear(p + "mlp.down_proj", g + "ffn_down", bias: false, scale: s),
-            activation: .SiLU)
+        let mlp = try await _ffn(w, ck, c.Generation, p, g)
         blocks.append(decoder.Standard(attnNorm: try await w.RMS(p + "input_layernorm", c.Eps), attention: attention,
                                        ffnNorm: try await w.RMS(p + "post_attention_layernorm", c.Eps), ffn: mlp))
     }
@@ -131,4 +136,24 @@ public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decod
                       : try await w.Linear("lm_head", "output", bias: c.Generation == .qwen2)
     return decoder.Network(on: d, dim: c.Dim, context: c.Context, embed: embed, blocks: blocks, kvHeads: c.KVHeads,
                            headDim: c.HeadDim, norm: try await w.RMS("model.norm", c.Eps), output: output)
+}
+
+// _ffn is layer p's (g's in a GGUF) MLP. Its biases never, and its scales
+// only in Qwen3's graph; a mixture of experts in the MoE generations, as
+// their graphs build it: Qwen2-MoE's weights not normalized, with a gated
+// shared expert; Qwen3-MoE's normalized, with the experts' scales.
+func _ffn(_ w: decoder.Weights, _ ck: model.Checkpoint, _ gen: Generation, _ p: string, _ g: string) async throws -> nn.FFN {
+    if gen.Experts {
+        if ck.Format != .gguf {
+            throw LoadError.unsupported("a mixture of experts from Hugging Face's layout is not read yet")
+        }
+        return try await decoder.MixtureOf(w, g, ck, gating: .softmax, norm: gen == .qwen3moe, expertScales: gen == .qwen3moe,
+                                           activation: .SiLU, shared: gen == .qwen2moe)
+    }
+    let s = gen == .qwen3
+    return try nn.GatedMLP.Fused(
+        gate: try await w.Linear(p + "mlp.gate_proj", g + "ffn_gate", bias: false, scale: s),
+        up: try await w.Linear(p + "mlp.up_proj", g + "ffn_up", bias: false, scale: s),
+        down: try await w.Linear(p + "mlp.down_proj", g + "ffn_down", bias: false, scale: s),
+        activation: .SiLU)
 }

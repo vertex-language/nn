@@ -6,6 +6,8 @@ import (
     "math"
     "model"
     "nn"
+    "nn/moe"
+    "tensor"
 )
 
 /// RopeKind is how a network turns queries and keys, llama.cpp's
@@ -98,6 +100,22 @@ public struct Spec {
     /// sliding_window_pattern names -- an array, one a layer, or n, every
     /// n-th layer full -- or else SWAPattern does; SWADenseFirst is
     /// llama.cpp's dense_first (layer 0 full, rather than the n-th).
+    /// MoE is whether the graph runs a mixture of experts where a file has
+    /// them ({arch}.expert_count): MoEGating its gating, MoENorm whether
+    /// the chosen weights are divided by their sum, MoEExpertScales
+    /// whether it reads the experts' ".scale"s, and MoESharedExpert whether
+    /// a shared expert (ffn_*_shexp) is added to every token's (Granite's).
+    /// {arch}.expert_weights_scale, where set, scales the weights; a
+    /// layer's exp_probs_b, where it has one, biases the choice. With
+    /// MoEFileGating and MoEFileNorm the file's expert_gating_func and
+    /// expert_weights_norm say instead, where it sets them (dots.llm1's).
+    public var MoE: bool = false
+    public var MoEGating: moe.Gating = .softmax
+    public var MoENorm: bool = true
+    public var MoEFileGating: bool = false
+    public var MoEFileNorm: bool = false
+    public var MoEExpertScales: bool = false
+    public var MoESharedExpert: bool = false
     public var SWA: bool = false
     public var SWAPattern: int = 0
     public var SWADenseFirst: bool = false
@@ -158,7 +176,7 @@ public func Key(_ ck: model.Checkpoint, _ name: string) -> float32 {
 public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async throws -> Network {
     let h = try Hparams.Read(ck, norm: s.Norm)
     let w = Weights(ck, on: d)
-    if let experts = ck.Config.Int("num_experts"), experts > 0 {
+    if let experts = ck.Config.Int("num_experts"), experts > 0, !s.MoE {
         throw DecoderError.invalid("a mixture of \(experts) experts is not run yet")
     }
     var factors: [float32]? = nil
@@ -172,6 +190,7 @@ public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async thr
     let layout = s.Rope == .neox ? neural.RopeLayout.halves : neural.RopeLayout.interleaved
     let scale = s.AttentionScale ? Key(ck, "attention.scale") : float32(0)
     let residual = s.ResidualScale ? Key(ck, "residual_scale") : float32(0)
+    let clamp = Key(ck, "attention.clamp_kqv")
     let swa = SlidingLayers(ck, h.Layers, s)
     var swaTable = table
     let swaBase = float32(ck.Config.Double("rope.freq_base_swa", gguf: "rope.freq_base_swa") ?? float64(h.RopeBase))
@@ -192,6 +211,7 @@ public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async thr
             heads: h.Heads, kvHeads: h.KVHeads, headDim: h.HeadDim, rope: rope)
         attention.Table = sliding ? swaTable : table
         attention.Scale = scale
+        attention.Clamp = clamp
         if sliding {
             attention.Window = swa.window
         }
@@ -200,7 +220,7 @@ public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async thr
             attention.KNorm = nn.HeadNorm(try await w.Norm(s.QKNormKind, g + "attn_k_norm", h.Eps, gg: g + "attn_k_norm"), each: s.QKNormEach)
             attention.NormAfterRope = s.QKNorm == .afterRope
         }
-        let ffn = try await _specFFN(w, s, g)
+        let ffn = try await _specFFN(w, s, g, ck)
         let b = Standard(attnNorm: s.PreNorms ? try await _specNorm(w, s, h, d, g + "attn_norm") : nil, attention: attention,
                          ffnNorm: s.PreNorms && s.FFNNorm != nil ? try await _specNorm(w, s, h, d, g + s.FFNNorm!) : nil, ffn: ffn)
         if let p = s.PostAttnNorm {
@@ -251,8 +271,21 @@ func _specNorm(_ w: Weights, _ s: Spec, _ h: Hparams, _ d: gpu.Device, _ base: s
     return nn.Norm(s.Norm, weight: weight, bias: bias, eps: h.Eps)
 }
 
-// _specFFN is layer g's MLP by a Spec.
-func _specFFN(_ w: Weights, _ s: Spec, _ g: string) async throws -> nn.FFN {
+// _specFFN is layer g's MLP by a Spec: its mixture of experts where the
+// file has experts.
+func _specFFN(_ w: Weights, _ s: Spec, _ g: string, _ ck: model.Checkpoint) async throws -> nn.FFN {
+    if s.MoE && w.Has(g + "ffn_gate_inp.weight", g + "ffn_gate_inp.weight") {
+        var gating = s.MoEGating
+        var norm = s.MoENorm
+        if s.MoEFileGating {
+            gating = moe.Gating.From(ck.Config.Int("expert_gating_func", gguf: "expert_gating_func") ?? 0, fallback: gating)
+        }
+        if s.MoEFileNorm {
+            norm = ck.Config.Bool("expert_weights_norm", gguf: "expert_weights_norm") ?? norm
+        }
+        return try await MixtureOf(w, g, ck, gating: gating, norm: norm, expertScales: s.MoEExpertScales,
+                                   activation: s.FFNActivation, shared: s.MoESharedExpert)
+    }
     let a = s.FFNActivation
     let down = try await w.Linear(g + "ffn_down", g + "ffn_down", biasFirst: true, bias: s.FFNBias, scale: s.FFNScale)
     let up = try await w.Linear(g + "ffn_up", g + "ffn_up", biasFirst: true, bias: s.FFNBias, scale: s.FFNScale)
@@ -303,4 +336,68 @@ public func MRope(_ ck: model.Checkpoint) -> bool {
         return false
     }
     return s[0] > 0 && s[1] > 0
+}
+
+/// MixtureOf is layer g's mixture of experts, as llama.cpp's build_moe_ffn
+/// reads it: the router ffn_gate_inp, the experts ffn_{gate,up,down}_exps
+/// (gate absent for ungated experts), {arch}.expert_used_count of them a
+/// token, {arch}.expert_weights_scale; and with shared, the shared expert
+/// ffn_{gate,up,down}_shexp added to every token's, behind its gate
+/// ffn_gate_inp_shexp where it has one.
+public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating: moe.Gating, norm: bool, expertScales: bool,
+                      activation: neural.Activation, shared: bool) async throws -> nn.FFN {
+    func experts(_ name: string) async throws -> moe.Experts {
+        var scales: gpu.Buffer<float32>? = nil
+        if expertScales && w.Has(g + name + ".scale", g + name + ".scale") {
+            scales = try await w.Floats(g + name + ".scale", g + name + ".scale")
+        }
+        return try moe.Experts(try await w.Tensor(g + name + ".weight", g + name + ".weight"), scales: scales)
+    }
+    let router = try await w.Linear(g + "ffn_gate_inp", g + "ffn_gate_inp", bias: false, scale: false)
+    var gate: moe.Experts? = nil
+    if w.Has(g + "ffn_gate_exps.weight", g + "ffn_gate_exps.weight") {
+        gate = try await experts("ffn_gate_exps")
+    }
+    let used = ck.Config.Int("num_experts_per_tok") ?? 2
+    let m = try moe.MoE(router: router, gate: gate, up: try await experts("ffn_up_exps"), down: try await experts("ffn_down_exps"),
+                        used: used)
+    m.Gating = gating
+    m.NormWeights = norm
+    m.WeightScale = Key(ck, "expert_weights_scale")
+    m.Activation = activation
+    if w.Has(g + "exp_probs_b.bias", g + "exp_probs_b.bias") {
+        m.SelectionBias = try await w.Floats(g + "exp_probs_b.bias", g + "exp_probs_b.bias")
+    }
+    if shared && w.Has(g + "ffn_up_shexp.weight", g + "ffn_up_shexp.weight") {
+        let s = try nn.GatedMLP.Fused(
+            gate: try await w.Linear(g + "ffn_gate_shexp", g + "ffn_gate_shexp", bias: false, scale: false),
+            up: try await w.Linear(g + "ffn_up_shexp", g + "ffn_up_shexp", bias: false, scale: false),
+            down: try await w.Linear(g + "ffn_down_shexp", g + "ffn_down_shexp", bias: false, scale: false),
+            activation: activation)
+        // Qwen2-MoE's shared expert is gated, a sigmoid a token.
+        if w.Has(g + "ffn_gate_inp_shexp.weight", g + "ffn_gate_inp_shexp.weight") {
+            // One row: the file's [dim] read as [1, dim].
+            let t = try await w.Tensor(g + "ffn_gate_inp_shexp.weight", g + "ffn_gate_inp_shexp.weight")
+            let gate = try nn.Linear(try tensor.Tensor(shape: [1, t.Shape[t.Shape.count - 1]], dtype: t.DType, storage: t.Storage))
+            return Sum([m, try moe.Gated(s, gate: gate, dim: m.Down.Rows)])
+        }
+        return Sum([m, s])
+    }
+    return m
+}
+
+/// Sum is FFNs of one input whose outputs add: a mixture and its shared
+/// expert.
+public final class Sum: nn.FFN {
+    public let Parts: [nn.FFN]
+
+    public init(_ parts: [nn.FFN]) {
+        self.Parts = parts
+    }
+
+    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+        for i in 0..<Parts.count {
+            try await Parts[i].Forward(x, rows: n, into: y, accumulate: accumulate || i > 0)
+        }
+    }
 }
