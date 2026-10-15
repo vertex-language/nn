@@ -76,6 +76,65 @@ func _ropeStore(_ qkv: gpu.MutableSpan<float32>, _ cos: gpu.Span<float32>, _ sin
     }
 }
 
+func _ropeStoreRows(_ qkv: gpu.Span<float32>, _ cos: gpu.Span<float32>, _ sin: gpu.Span<float32>,
+                    _ ck: gpu.MutableSpan<float32>, _ cv: gpu.MutableSpan<float32>, _ qh: gpu.MutableSpan<float32>,
+                    _ heads: int, _ kvHeads: int, _ dim: int, _ row0: int, _ count: int, _ position0: int, _ capacity: int,
+                    _ halves: int) kernel {
+    // _ropeStore for a run of count tokens (z), rows row0... of qkv, at
+    // positions position0...: Q's pairs turned into qh, laid out [heads,
+    // count, dim] as attention takes it; K's turned into the cache, V's
+    // copied there. Attention checked the counts.
+    let p = gpu.Index.x
+    let h = gpu.Index.y
+    let i = gpu.Index.z
+    let pairs = dim &>> 1
+    if p >= pairs || i >= count { return }
+    var ia = 2 &* p
+    var ib = ia &+ 1
+    if halves != 0 {
+        ia = p
+        ib = p &+ pairs
+    }
+    let position = position0 &+ i
+    let x = qkv._base + ((row0 &+ i) &* (heads &+ 2 &* kvHeads) &+ h) &* dim
+    if h < heads &+ kvHeads {
+        let at = position &* pairs &+ p
+        let c = cos._base[at], s = sin._base[at]
+        let a = x[ia], b = x[ib]
+        let ra = a * c - b * s, rb = a * s + b * c
+        if h < heads {
+            let row = qh._base + (h &* count &+ i) &* dim
+            row[ia] = ra
+            row[ib] = rb
+        } else {
+            let row = ck._base + ((h &- heads) &* capacity &+ position) &* dim
+            row[ia] = ra
+            row[ib] = rb
+        }
+    } else {
+        let row = cv._base + ((h &- heads &- kvHeads) &* capacity &+ position) &* dim
+        row[ia] = x[ia]
+        row[ib] = x[ib]
+    }
+}
+
+/// Run is the part of a batch that is one sequence's: count tokens from
+/// row Row of the batch, at positions Position..., attending to the keys
+/// already in Cache before them.
+public struct Run {
+    public var Row: int
+    public var Count: int
+    public var Position: int
+    public var Cache: Cache
+
+    public init(row: int, count: int, position: int, cache: Cache) {
+        self.Row = row
+        self.Count = count
+        self.Position = position
+        self.Cache = cache
+    }
+}
+
 /// Rope is how an Attention turns its queries and keys by position: the
 /// frequency base, and which elements of a head pair up -- a property of
 /// the checkpoint's Q and K weights (neural.RopeLayout).
@@ -112,6 +171,12 @@ public final class Attention {
     /// gives its layers one to share; one without is made at the first
     /// Forward.
     public var Table: neural.RopeTable? = nil
+    // A batch's buffers, grown to the most rows seen.
+    var _rows = 0
+    var _batchQKV: gpu.Buffer<float32>? = nil
+    var _batchQ: gpu.Buffer<float32>? = nil
+    var _batchO: gpu.Buffer<float32>? = nil
+    var _batchMerged: gpu.Buffer<float32>? = nil
 
     public init(qkv: [Linear], o: Linear, heads: int, kvHeads: int, headDim: int, rope: Rope) throws {
         var out = 0
@@ -138,6 +203,61 @@ public final class Attention {
     /// product makes all three, and no weight is copied.
     public static func Fused(q: Linear, k: Linear, v: Linear, o: Linear, heads: int, kvHeads: int, rope: Rope) throws -> Attention {
         return try Attention(qkv: try Stacked([q, k, v]), o: o, heads: heads, kvHeads: kvHeads, headDim: q.Out / heads, rope: rope)
+    }
+
+    /// Forward attends n tokens -- x's rows, one or more runs of
+    /// sequences -- each to itself and the tokens before it in its run's
+    /// cache, adds them to the caches, and writes the output projection of
+    /// each into its row of y, or with accumulate adds it.
+    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, runs: [Run], into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+        if n == 1 && runs.count == 1 {
+            try await Forward(x, position: runs[0].Position, cache: runs[0].Cache, into: y, accumulate: accumulate)
+            return
+        }
+        if HeadDim % 2 != 0 {
+            throw LayerError.unsupported("a batch through heads of odd dimension \(HeadDim)")
+        }
+        if _rows < n {
+            try _grow(n)
+        }
+        let qkv = _batchQKV!, qh = _batchQ!, oh = _batchO!, merged = _batchMerged!
+        try await nn.Forward(QKV, x, rows: n, into: qkv)
+        let hd = Heads * HeadDim
+        for r in runs {
+            let cache = r.Cache
+            if r.Count == 0 { continue }
+            if r.Row < 0 || r.Row + r.Count > n || r.Position < 0 || r.Position + r.Count > cache.Capacity
+                || cache.KVHeads != KVHeads || cache.HeadDim != HeadDim {
+                throw LayerError.unsupported("a run of \(r.Count) tokens at row \(r.Row) and position \(r.Position) in a batch of \(n) and a cache of \(cache.Capacity)")
+            }
+            if Table == nil || !Table!.Fits(dim: HeadDim, positions: cache.Capacity, base: Rope.Base) {
+                Table = try await neural.RopeTable.Make(on: _qkv.Device, dim: HeadDim, positions: cache.Capacity, base: Rope.Base)
+            }
+            let t = Table!
+            let q = qh.Slice(from: r.Row * hd, count: r.Count * hd)
+            let o = oh.Slice(from: r.Row * hd, count: r.Count * hd)
+            try await _ropeStoreRows.Launch(qkv, t.Cos, t.Sin, cache.K, cache.V, q, Heads, KVHeads, HeadDim, r.Row, r.Count,
+                                            r.Position, cache.Capacity, Rope.Layout == .halves ? 1 : 0,
+                                            over: ((HeadDim / 2 + 31) / 32 * 32, Heads + 2 * KVHeads, r.Count), workgroup: (32, 1, 1))
+            let shape = attention.Shape(heads: Heads, kvHeads: KVHeads, queries: r.Count, keys: r.Position + r.Count,
+                                        headDim: HeadDim, keyCapacity: cache.Capacity)
+            try await attention.Forward(q: q, k: cache.K, v: cache.V, into: o, shape, mask: .Causal)
+            try await neural.MergeHeads(o, into: merged.Slice(from: r.Row * hd, count: r.Count * hd), rows: r.Count, heads: Heads, dim: HeadDim)
+        }
+        try await O.Forward(merged, rows: n, into: y, accumulate: accumulate)
+    }
+
+    // _grow makes the batch buffers room for n rows: apart from Forward
+    // because the compiler's SIL verifier rejects CreateBuffer specialized
+    // inside a branch of an async function.
+    func _grow(_ n: int) throws {
+        let d = _qkv.Device
+        let hd = Heads * HeadDim
+        _batchQKV = try d.CreateBuffer(of: float32.self, count: n * (hd + 2 * KVHeads * HeadDim))
+        _batchQ = try d.CreateBuffer(of: float32.self, count: n * hd)
+        _batchO = try d.CreateBuffer(of: float32.self, count: n * hd)
+        _batchMerged = try d.CreateBuffer(of: float32.self, count: n * hd)
+        _rows = n
     }
 
     /// Forward attends x, the token at position, to itself and the tokens
