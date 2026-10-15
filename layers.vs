@@ -126,6 +126,17 @@ public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, into y: gpu.B
     }
 }
 
+func _gatherRow(_ table: gpu.Span<float32>, _ rows: gpu.Span<int32>, _ index: int, _ tableRows: int, _ y: gpu.MutableSpan<float32>, _ n: int) kernel {
+    // Row rows[index] of a float32 table into y: a row past the table is
+    // row 0.
+    let i = gpu.Index.x
+    if i < n {
+        var r = int(rows[index])
+        if r < 0 || r >= tableRows { r = 0 }
+        y[i] = table[r * n + i]
+    }
+}
+
 /// Embedding is a table of vectors, one a token: a [count, dim] weight,
 /// float32, a half type or block-quantized.
 public struct Embedding {
@@ -139,6 +150,35 @@ public struct Embedding {
     }
 
     public var Dim: int { return Weight.Shape[1] }
+
+    /// Lookup writes the vector of token tokens[index] into x, the token
+    /// read on the device: a token the device chose -- greedy decoding's
+    /// next -- looked up with nothing read back. A token outside the table
+    /// is token 0.
+    public func Lookup(tokens: gpu.Buffer<int32>, at index: int, into x: gpu.Buffer<float32>) async throws {
+        let rb = Weight.RowBytes
+        switch Weight.DType {
+        case .F32:
+            if index < 0 || index >= tokens.count || x.count < Dim {
+                throw LayerError.unsupported("a lookup of token \(index) of \(tokens.count), into \(x.count) of \(Dim)")
+            }
+            try await _gatherRow.Launch(try Weight.Floats(), tokens, index, Weight.Shape[0], x, Dim, over: Dim)
+        case .F16:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.F16(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        case .BF16:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.BF16(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        case .Q4_0:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.Q4_0(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        case .Q8_0:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.Q8_0(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        case .Q4_K:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.Q4_K(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        case .Q6_K:
+            try await dtype.DequantizeRow(Weight.Storage, dtype.Q6_K(), rows: tokens, index: index, rowBytes: rb, count: Dim, into: x)
+        default:
+            throw LayerError.unsupported("an Embedding of \(Weight.DType.Name)")
+        }
+    }
 
     /// Lookup writes token's vector into x.
     public func Lookup(_ token: int, into x: gpu.Buffer<float32>) async throws {
