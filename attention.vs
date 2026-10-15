@@ -181,15 +181,24 @@ public struct Rope {
     }
 }
 
-/// HeadNorm is a norm over Q's or K's heads before they turn: over each
-/// head (a weight of head dimension, shared by the heads -- Qwen3's,
-/// Gemma 3's), or over all the heads of a token at once (a weight of heads
-/// times head dimension -- OLMo 2's).
+/// HeadNorm is a norm over Q's or K's heads: over each head -- with a
+/// weight of head dimension the heads share (Qwen3's, Gemma 3's), or one
+/// for each head (StableLM's, Command R's) -- or over all the heads of a
+/// token at once, a weight of heads times head dimension (OLMo 2's).
 public struct HeadNorm {
     public let Norm: Norm
+    /// Each is whether each head is normalized by itself.
+    public let Each: bool
 
+    /// A norm of each head where its weight is one head's, else of all.
     public init(_ norm: Norm) {
         self.Norm = norm
+        self.Each = false
+    }
+
+    public init(_ norm: Norm, each: bool) {
+        self.Norm = norm
+        self.Each = each
     }
 }
 
@@ -216,6 +225,9 @@ public final class Attention {
     public var NormAfterRope: bool = false
     /// Scale is the scores' scale: 0 for 1/√HeadDim.
     public var Scale: float32 = 0
+    /// Window, when above 0, is a sliding window: a query sees itself and
+    /// the Window - 1 keys before it.
+    public var Window: int = 0
     /// Table is the cosines and sines the rotation is read from: a model
     /// gives its layers one to share; one without is made at the first
     /// Forward.
@@ -274,15 +286,16 @@ public final class Attention {
         guard let h = hn else { return }
         let norm = h.Norm
         let width = (Heads + 2 * KVHeads) * HeadDim
-        let perHead = norm.Count == HeadDim
-        if !perHead && norm.Count != heads * HeadDim {
+        let shared = norm.Count == HeadDim
+        if !shared && norm.Count != heads * HeadDim {
             throw LayerError.unsupported("a head norm of \(norm.Count) for \(heads) heads of \(HeadDim)")
         }
-        let len = perHead ? HeadDim : heads * HeadDim
-        let segs = perHead ? heads : 1
+        let each = shared || h.Each
+        let len = each ? HeadDim : heads * HeadDim
+        let segs = each ? heads : 1
         let w = try norm.Weights()
         let b = norm.Bias ?? w
-        try await _segmentNorm.Launch(qkv, w, b, norm.Bias != nil, norm.Kind == .layer, width, first * HeadDim, len, segs, perHead,
+        try await _segmentNorm.Launch(qkv, w, b, norm.Bias != nil, norm.Kind == .layer, width, first * HeadDim, len, segs, shared,
                                       norm.Eps, over: n * segs * 64, workgroup: 64)
     }
 
@@ -344,7 +357,8 @@ public final class Attention {
                                             over: ((HeadDim / 2 + 31) / 32 * 32, Heads + 2 * KVHeads, r.Count), workgroup: (32, 1, 1))
             let shape = attention.Shape(heads: Heads, kvHeads: KVHeads, queries: r.Count, keys: r.Position + r.Count,
                                         headDim: HeadDim, scale: Scale, keyCapacity: cache.Capacity)
-            try await attention.Forward(q: q, k: cache.K, v: cache.V, into: o, shape, mask: .Causal)
+            try await attention.Forward(q: q, k: cache.K, v: cache.V, into: o, shape,
+                                        mask: Window > 0 ? attention.Mask.SlidingWindow(Window) : attention.Mask.Causal)
             if r.Count == 1 && n == 1 {
                 // One token's heads, one after another, are its row.
                 try await O.Forward(o, into: y, accumulate: accumulate)
