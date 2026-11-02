@@ -38,9 +38,9 @@ public protocol Memory: AnyObject {
     var Capacity: int { get }
     /// Length is how many positions sequence s holds: the position its
     /// next token takes.
-    func Length(_ s: int) -> int
+    func Length(s: int) -> int
     /// Truncate drops sequence s's positions from `from` on.
-    func Truncate(_ s: int, from: int)
+    func Truncate(s: int, from: int)
     /// Clear drops every sequence's positions.
     func Clear()
 }
@@ -73,11 +73,11 @@ public final class KV: Memory {
         self._lengths = [int](repeating: 0, count: sequences)
     }
 
-    public func Length(_ s: int) -> int {
+    public func Length(s: int) -> int {
         return s >= 0 && s < Sequences ? _lengths[s] : 0
     }
 
-    public func Truncate(_ s: int, from: int) {
+    public func Truncate(s: int, from: int) {
         if s >= 0 && s < Sequences && from < _lengths[s] {
             _lengths[s] = max(0, from)
         }
@@ -90,7 +90,7 @@ public final class KV: Memory {
     }
 
     /// Layer is sequence s's cache for layer l, made if it is not yet.
-    public func Layer(_ l: int, sequence s: int) throws -> nn.Cache {
+    public func Layer(l: int, sequence s: int) throws -> nn.Cache {
         if s < 0 || s >= MaxSequences {
             throw MemoryError.unknownSequence(s, MaxSequences)
         }
@@ -109,7 +109,7 @@ public final class KV: Memory {
     }
 
     /// Wrote records that sequence s now holds positions up to end.
-    public func Wrote(_ s: int, through end: int) throws {
+    public func Wrote(s: int, through end: int) throws {
         if s < 0 || s >= Sequences {
             throw MemoryError.unknownSequence(s, Sequences)
         }

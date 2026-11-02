@@ -52,7 +52,7 @@ public struct Linear {
     public let BiasFirst: bool
     let _scratch: _Scratch
 
-    public init(_ weight: tensor.Tensor, bias: gpu.Buffer<float32>? = nil, scale: float32 = 1, biasFirst: bool = false) throws {
+    public init(weight: tensor.Tensor, bias: gpu.Buffer<float32>? = nil, scale: float32 = 1, biasFirst: bool = false) throws {
         try self.init(stacking: [weight], biases: [bias], scales: [scale], biasFirst: biasFirst)
     }
 
@@ -96,7 +96,7 @@ public struct Linear {
     // _affine writes the scaled and biased product of n rows -- t, packed,
     // Out a row -- into y's rows of stride floats from column, or with
     // accumulate adds it.
-    func _affine(_ t: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool, stride: int, column: int) async throws {
+    func _affine(t: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool, stride: int, column: int) async throws {
         let out = Out
         let ldy = stride == 0 ? out : stride
         var off = 0
@@ -124,7 +124,7 @@ public struct Linear {
     /// column. With accumulate it adds them to what y holds. One token is
     /// a matrix-vector product; more are one matrix product, each tile of
     /// weights read once for 32 tokens.
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool = false,
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool = false,
                         stride: int = 0, column: int = 0) async throws {
         if n == 1 && column == 0 {
             try await Forward(x, into: y, accumulate: accumulate)
@@ -139,7 +139,7 @@ public struct Linear {
         try await _gemm(x, rows: n, into: y, accumulate: accumulate, stride: stride, column: column)
     }
 
-    func _gemm(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool, stride: int, column: int) async throws {
+    func _gemm(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool, stride: int, column: int) async throws {
         let rows = Parts.map { $0.Shape[0] }
         let w = Parts.map { $0.Storage }
         switch Weight.DType {
@@ -165,7 +165,7 @@ public struct Linear {
     /// Forward writes W·x into y: x has In elements, y Out. With
     /// accumulate it adds W·x to what y holds: a residual connection in the
     /// same pass.
-    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+    public func Forward(x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         if Plain {
             try await _product(x, into: y, accumulate: accumulate)
             return
@@ -175,7 +175,7 @@ public struct Linear {
         try await _affine(t, rows: 1, into: y, accumulate: accumulate, stride: 0, column: 0)
     }
 
-    func _product(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+    func _product(x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         let rows = Parts.map { $0.Shape[0] }
         switch Weight.DType {
         case .F32:
@@ -204,7 +204,7 @@ public struct Linear {
 /// one format stacked into one (one product for them), so that together
 /// they write the weights' outputs one after another. Q and K of q4_K
 /// with V of q6_K -- a Q4_K_M file's attention -- are two.
-public func Stacked(_ weights: [Linear]) throws -> [Linear] {
+public func Stacked(weights: [Linear]) throws -> [Linear] {
     var out: [Linear] = []
     var group: [tensor.Tensor] = []
     var biases: [gpu.Buffer<float32>?] = []
@@ -231,8 +231,8 @@ public func Stacked(_ weights: [Linear]) throws -> [Linear] {
     return out
 }
 
-func _affineRows(_ t: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ b: gpu.Span<float32>, _ hasBias: bool, _ biasFirst: bool, _ scale: float32,
-                 _ n: int, _ out: int, _ off: int, _ m: int, _ ldy: int, _ col: int, _ accumulate: bool) kernel {
+func _affineRows(t: gpu.Span<float32>, y: gpu.MutableSpan<float32>, b: gpu.Span<float32>, hasBias: bool, biasFirst: bool, scale: float32,
+                 n: int, out: int, off: int, m: int, ldy: int, col: int, accumulate: bool) kernel {
     // Row r, element j of a part: s·t[r, off + j] + b[j] (or s·(t + b)),
     // into y[r, col + j].
     let j = gpu.Index.x
@@ -254,7 +254,7 @@ func _affineRows(_ t: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ b: gpu
 final class _Scratch {
     var buf: gpu.Buffer<float32>? = nil
 
-    func Floats(_ d: gpu.Device, _ n: int) throws -> gpu.Buffer<float32> {
+    func Floats(d: gpu.Device, n: int) throws -> gpu.Buffer<float32> {
         if buf == nil || buf!.count < n {
             buf = try d.CreateBuffer(of: float32.self, count: n)
         }
@@ -264,7 +264,7 @@ final class _Scratch {
 
 /// Forward runs Linears of one input into consecutive slices of y: what
 /// Stacked makes of several projections, as one.
-public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>) async throws {
+public func Forward(linears: [Linear], x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>) async throws {
     var at = 0
     for l in linears {
         try await l.Forward(x, into: linears.count == 1 ? y : y.Slice(from: at, count: l.Out))
@@ -275,7 +275,7 @@ public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, into y: gpu.B
 /// Forward runs Linears of one input over n tokens: each token's outputs
 /// the Linears' one after another in its row of y, as Forward(_:_:into:)
 /// writes one token's.
-public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>) async throws {
+public func Forward(linears: [Linear], x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>) async throws {
     if n == 1 {
         try await Forward(linears, x, into: y)
         return
@@ -289,7 +289,7 @@ public func Forward(_ linears: [Linear], _ x: gpu.Buffer<float32>, rows n: int, 
     }
 }
 
-func _gatherRow(_ table: gpu.Span<float32>, _ rows: gpu.Span<int32>, _ index: int, _ tableRows: int, _ y: gpu.MutableSpan<float32>, _ n: int) kernel {
+func _gatherRow(table: gpu.Span<float32>, rows: gpu.Span<int32>, index: int, tableRows: int, y: gpu.MutableSpan<float32>, n: int) kernel {
     // Row rows[index] of a float32 table into y: a row past the table is
     // row 0.
     let i = gpu.Index.x
@@ -305,7 +305,7 @@ func _gatherRow(_ table: gpu.Span<float32>, _ rows: gpu.Span<int32>, _ index: in
 public struct Embedding {
     public let Weight: tensor.Tensor
 
-    public init(_ weight: tensor.Tensor) throws {
+    public init(weight: tensor.Tensor) throws {
         if weight.Shape.count != 2 {
             throw LayerError.unsupported("an Embedding's weight is [count, dim], not \(weight.Shape)")
         }
@@ -363,7 +363,7 @@ public struct Embedding {
     }
 
     /// Lookup writes token's vector into x.
-    public func Lookup(_ token: int, into x: gpu.Buffer<float32>) async throws {
+    public func Lookup(token: int, into x: gpu.Buffer<float32>) async throws {
         let at = token * Weight.RowBytes
         switch Weight.DType {
         case .F32:
@@ -391,18 +391,18 @@ public struct RMSNorm {
     public let Weight: tensor.Tensor
     public let Eps: float32
 
-    public init(_ weight: tensor.Tensor, eps: float32) {
+    public init(weight: tensor.Tensor, eps: float32) {
         self.Weight = weight
         self.Eps = eps
     }
 
     /// Forward normalizes rows rows of x into y.
-    public func Forward(_ x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
         try await neural.RMSNorm(x, weight: try Weight.Floats(), into: y, rows: rows, cols: Weight.Count, eps: Eps)
     }
 }
 
-func _gatedRows(_ gu: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ a: int32, _ hidden: int, _ n: int) kernel {
+func _gatedRows(gu: gpu.Span<float32>, y: gpu.MutableSpan<float32>, a: int32, hidden: int, n: int) kernel {
     // Row t of gu is [gate, up], hidden each; row t of y is a(gate)·up.
     let i = gpu.Index.x
     let t = gpu.Index.y
@@ -449,13 +449,13 @@ public final class GatedMLP: FFN {
     // _grow makes the batch buffer count floats: apart from Forward because
     // the compiler's SIL verifier rejects CreateBuffer specialized inside a
     // branch of an async function.
-    func _grow(_ count: int) throws {
+    func _grow(count: int) throws {
         _batch = try Down.Device.CreateBuffer(of: float32.self, count: count)
     }
 
     /// Forward writes the MLP of n tokens' rows of x into y's, or with
     /// accumulate adds it.
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         if n == 1 {
             try await Forward(x, into: y, accumulate: accumulate)
             return
@@ -473,7 +473,7 @@ public final class GatedMLP: FFN {
     }
 
     /// Forward writes the MLP of x into y, or with accumulate adds it.
-    public func Forward(_ x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+    public func Forward(x: gpu.Buffer<float32>, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         try await nn.Forward(GateUp, x, into: _gateUp)
         try await neural.Gated(_up, gate: _gate, Activation, into: _up)
         try await Down.Forward(_up, into: y, accumulate: accumulate)

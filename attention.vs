@@ -28,10 +28,10 @@ public final class Cache {
     }
 }
 
-func _ropeStoreRows(_ qkv: gpu.Span<float32>, _ cos: gpu.Span<float32>, _ sin: gpu.Span<float32>,
-                    _ ck: gpu.MutableSpan<float32>, _ cv: gpu.MutableSpan<float32>, _ qh: gpu.MutableSpan<float32>,
-                    _ heads: int, _ kvHeads: int, _ dim: int, _ rot: int, _ row0: int, _ count: int, _ position0: int,
-                    _ capacity: int, _ halves: int) kernel {
+func _ropeStoreRows(qkv: gpu.Span<float32>, cos: gpu.Span<float32>, sin: gpu.Span<float32>,
+                    ck: gpu.MutableSpan<float32>, cv: gpu.MutableSpan<float32>, qh: gpu.MutableSpan<float32>,
+                    heads: int, kvHeads: int, dim: int, rot: int, row0: int, count: int, position0: int,
+                    capacity: int, halves: int) kernel {
     // A run of count tokens (z), rows row0... of qkv -- each row the
     // token's Q, K and V heads one after another -- at positions
     // position0...: Q's heads turned into qh, laid out [heads, count, dim]
@@ -85,8 +85,8 @@ func _ropeStoreRows(_ qkv: gpu.Span<float32>, _ cos: gpu.Span<float32>, _ sin: g
     row[ib] = b
 }
 
-func _ropeRows(_ qkv: gpu.MutableSpan<float32>, _ cos: gpu.Span<float32>, _ sin: gpu.Span<float32>,
-               _ heads: int, _ kvHeads: int, _ dim: int, _ rot: int, _ row0: int, _ count: int, _ position0: int, _ halves: int) kernel {
+func _ropeRows(qkv: gpu.MutableSpan<float32>, cos: gpu.Span<float32>, sin: gpu.Span<float32>,
+               heads: int, kvHeads: int, dim: int, rot: int, row0: int, count: int, position0: int, halves: int) kernel {
     // _ropeStoreRows's turn, in place in qkv: Q's and K's heads (y) of a
     // run of count tokens (z), for a norm that comes after it.
     let p = gpu.Index.x
@@ -108,7 +108,7 @@ func _ropeRows(_ qkv: gpu.MutableSpan<float32>, _ cos: gpu.Span<float32>, _ sin:
     x[ib] = a * s + b * c
 }
 
-func _clampRows(_ x: gpu.MutableSpan<float32>, _ c: float32, _ n: int) kernel {
+func _clampRows(x: gpu.MutableSpan<float32>, c: float32, n: int) kernel {
     // Each value within ±c.
     let i = gpu.Index.x
     if i < n {
@@ -116,8 +116,8 @@ func _clampRows(_ x: gpu.MutableSpan<float32>, _ c: float32, _ n: int) kernel {
     }
 }
 
-func _segmentNorm(_ x: gpu.MutableSpan<float32>, _ w: gpu.Span<float32>, _ b: gpu.Span<float32>, _ hasBias: bool, _ layer: bool,
-                  _ width: int, _ offset: int, _ len: int, _ segs: int, _ shared: bool, _ eps: float32) kernel {
+func _segmentNorm(x: gpu.MutableSpan<float32>, w: gpu.Span<float32>, b: gpu.Span<float32>, hasBias: bool, layer: bool,
+                  width: int, offset: int, len: int, segs: int, shared: bool, eps: float32) kernel {
     // A workgroup a segment: elements offset + s·len ..< + len of row r of
     // x (width a row), normalized in place -- by root mean square, or with
     // layer to zero mean and unit variance -- then times the weight (and
@@ -199,12 +199,12 @@ public struct HeadNorm {
     public let Each: bool
 
     /// A norm of each head where its weight is one head's, else of all.
-    public init(_ norm: Norm) {
+    public init(norm: Norm) {
         self.Norm = norm
         self.Each = false
     }
 
-    public init(_ norm: Norm, each: bool) {
+    public init(norm: Norm, each: bool) {
         self.Norm = norm
         self.Each = each
     }
@@ -282,7 +282,7 @@ public final class Attention {
     // _grow makes the batch buffers room for n rows: apart from Forward
     // because the compiler's SIL verifier rejects CreateBuffer specialized
     // inside a branch of an async function.
-    func _grow(_ n: int) throws {
+    func _grow(n: int) throws {
         let d = O.Device
         let hd = Heads * HeadDim
         _qkv = try d.CreateBuffer(of: float32.self, count: n * (hd + 2 * KVHeads * HeadDim))
@@ -293,7 +293,7 @@ public final class Attention {
     }
 
     // _norm normalizes n rows' Q or K heads in place, where a norm says.
-    func _norm(_ qkv: gpu.Buffer<float32>, rows n: int, _ hn: HeadNorm?, first: int, heads: int) async throws {
+    func _norm(qkv: gpu.Buffer<float32>, rows n: int, hn: HeadNorm?, first: int, heads: int) async throws {
         guard let h = hn else { return }
         let norm = h.Norm
         let width = (Heads + 2 * KVHeads) * HeadDim
@@ -313,7 +313,7 @@ public final class Attention {
     /// Forward attends x, the token at position, to itself and the tokens
     /// before it in cache, adds it to the cache, and writes the output
     /// projection into y -- or with accumulate adds it to y.
-    public func Forward(_ x: gpu.Buffer<float32>, position: int, cache: Cache, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+    public func Forward(x: gpu.Buffer<float32>, position: int, cache: Cache, into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         try await Forward(x, rows: 1, runs: [Run(row: 0, count: 1, position: position, cache: cache)], into: y, accumulate: accumulate)
     }
 
@@ -321,7 +321,7 @@ public final class Attention {
     /// sequences -- each to itself and the tokens before it in its run's
     /// cache, adds them to the caches, and writes the output projection of
     /// each into its row of y, or with accumulate adds it.
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, runs: [Run], into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, runs: [Run], into y: gpu.Buffer<float32>, accumulate: bool = false) async throws {
         if _rows < n {
             try _grow(n)
         }

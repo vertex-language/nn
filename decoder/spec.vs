@@ -140,10 +140,10 @@ public struct Hparams {
     public var RopeBase: float32
 
     /// Read is the checkpoint's decoder shape.
-    public static func Read(_ ck: model.Checkpoint, norm: nn.NormKind = .rms) throws -> Hparams {
+    public static func Read(ck: model.Checkpoint, norm: nn.NormKind = .rms) throws -> Hparams {
         ck.Aliases = Aliases
         let c = ck.Config
-        func need(_ key: string) throws -> int {
+        func need(key: string) throws -> int {
             guard let n = c.Int(key) else {
                 throw DecoderError.invalid("no \(key) in the config")
             }
@@ -171,12 +171,12 @@ public struct Hparams {
 
 /// Key is a float under the checkpoint's architecture in a GGUF
 /// ({arch}.name), or 0 where it is not there.
-public func Key(_ ck: model.Checkpoint, _ name: string) -> float32 {
+public func Key(ck: model.Checkpoint, name: string) -> float32 {
     return float32(ck.Config.Double(name, gguf: name) ?? 0)
 }
 
 /// Build reads a GGUF of Standard layers onto device d, by its Spec.
-public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async throws -> Network {
+public func Build(ck: model.Checkpoint, on d: gpu.Device, s: Spec) async throws -> Network {
     let h = try Hparams.Read(ck, norm: s.Norm)
     let w = Weights(ck, on: d)
     if let experts = ck.Config.Int("num_experts"), experts > 0, !s.MoE {
@@ -263,7 +263,7 @@ public func Build(_ ck: model.Checkpoint, on d: gpu.Device, _ s: Spec) async thr
 }
 
 // _specNorm is the norm a Spec's network has at base.
-func _specNorm(_ w: Weights, _ s: Spec, _ h: Hparams, _ d: gpu.Device, _ base: string) async throws -> nn.Norm {
+func _specNorm(w: Weights, s: Spec, h: Hparams, d: gpu.Device, base: string) async throws -> nn.Norm {
     if !s.NormWeights {
         return try await nn.Norm.Plain(s.Norm, count: h.Dim, on: d, eps: h.Eps)
     }
@@ -277,7 +277,7 @@ func _specNorm(_ w: Weights, _ s: Spec, _ h: Hparams, _ d: gpu.Device, _ base: s
 
 // _specFFN is layer g's MLP by a Spec: its mixture of experts where the
 // file has experts.
-func _specFFN(_ w: Weights, _ s: Spec, _ g: string, _ ck: model.Checkpoint) async throws -> nn.FFN {
+func _specFFN(w: Weights, s: Spec, g: string, ck: model.Checkpoint) async throws -> nn.FFN {
     if s.MoE && w.Has(g + "ffn_gate_inp.weight", g + "ffn_gate_inp.weight") {
         var gating = s.MoEGating
         var norm = s.MoENorm
@@ -306,7 +306,7 @@ func _specFFN(_ w: Weights, _ s: Spec, _ g: string, _ ck: model.Checkpoint) asyn
 /// SlidingLayers is which of a network's layers attend through a sliding
 /// window, and its width (0: none), as llama.cpp's load_swa_pattern reads
 /// them for a Spec.
-public func SlidingLayers(_ ck: model.Checkpoint, _ layers: int, _ s: Spec) -> (window: int, layers: [bool]) {
+public func SlidingLayers(ck: model.Checkpoint, layers: int, s: Spec) -> (window: int, layers: [bool]) {
     var out = [bool](repeating: false, count: layers)
     if !s.SWA {
         return (window: 0, layers: out)
@@ -334,7 +334,7 @@ public func SlidingLayers(_ ck: model.Checkpoint, _ layers: int, _ s: Spec) -> (
 /// MRope is whether a GGUF's rotary embeddings are multimodal (M-RoPE): its
 /// rope.dimension_sections set, as llama.cpp's use_mrope asks. For text,
 /// every section's position is the token's, so M-RoPE turns as NeoX does.
-public func MRope(_ ck: model.Checkpoint) -> bool {
+public func MRope(ck: model.Checkpoint) -> bool {
     let key = "rope.dimension_sections"
     guard let s = ck.Config.Ints(key, gguf: key), s.count >= 2 else {
         return false
@@ -349,9 +349,9 @@ public func MRope(_ ck: model.Checkpoint) -> bool {
 /// ffn_{gate,up,down}_shexp added to every token's, behind its gate
 /// ffn_gate_inp_shexp where it has one. With expertScales the experts' and
 /// the shared expert's ".scale"s apply.
-public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating: moe.Gating, norm: bool, expertScales: bool,
+public func MixtureOf(w: Weights, g: string, ck: model.Checkpoint, gating: moe.Gating, norm: bool, expertScales: bool,
                       activation: neural.Activation, shared: bool) async throws -> nn.FFN {
-    func experts(_ name: string) async throws -> moe.Experts {
+    func experts(name: string) async throws -> moe.Experts {
         var scales: gpu.Buffer<float32>? = nil
         if expertScales && w.Has(g + name + ".scale", g + name + ".scale") {
             scales = try await w.Floats(g + name + ".scale", g + name + ".scale")
@@ -388,8 +388,8 @@ public func MixtureOf(_ w: Weights, _ g: string, _ ck: model.Checkpoint, gating:
 
 // _mixture is the experts of a MixtureOf: gate and up apart, or one
 // weight (ffn_gate_up_exps, HY V3's).
-func _mixture(_ w: Weights, _ g: string, _ router: nn.Linear, _ used: int,
-              _ experts: (string) async throws -> moe.Experts) async throws -> moe.MoE {
+func _mixture(w: Weights, g: string, router: nn.Linear, used: int,
+              experts: (string) async throws -> moe.Experts) async throws -> moe.MoE {
     if w.Has(g + "ffn_gate_up_exps.weight", g + "ffn_gate_up_exps.weight") {
         return try moe.MoE(router: router, gateUp: try await experts("ffn_gate_up_exps"), down: try await experts("ffn_down_exps"),
                            used: used)
@@ -407,11 +407,11 @@ func _mixture(_ w: Weights, _ g: string, _ router: nn.Linear, _ used: int,
 public final class Sum: nn.FFN {
     public let Parts: [nn.FFN]
 
-    public init(_ parts: [nn.FFN]) {
+    public init(parts: [nn.FFN]) {
         self.Parts = parts
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         for i in 0..<Parts.count {
             try await Parts[i].Forward(x, rows: n, into: y, accumulate: accumulate || i > 0)
         }

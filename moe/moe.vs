@@ -44,7 +44,7 @@ public enum Gating: Equatable {
     /// From is the gating llama.cpp's {arch}.expert_gating_func names (1
     /// softmax, 2 sigmoid, 3 softmax of the chosen weights, 4 √softplus),
     /// or fallback for 0, absent.
-    public static func From(_ code: int, fallback: Gating) -> Gating {
+    public static func From(code: int, fallback: Gating) -> Gating {
         switch code {
         case 1: return .softmax
         case 2: return .sigmoid
@@ -66,8 +66,8 @@ public enum MoEError: Error, CustomStringConvertible {
     }
 }
 
-func _route(_ logits: gpu.Span<float32>, _ bias: gpu.Span<float32>, _ ids: gpu.MutableSpan<int32>, _ weights: gpu.MutableSpan<float32>,
-            _ experts: int, _ used: int, _ gating: int32, _ hasBias: bool, _ norm: bool, _ scale: float32) kernel {
+func _route(logits: gpu.Span<float32>, bias: gpu.Span<float32>, ids: gpu.MutableSpan<int32>, weights: gpu.MutableSpan<float32>,
+            experts: int, used: int, gating: int32, hasBias: bool, norm: bool, scale: float32) kernel {
     // A token a workgroup: its experts' probabilities from its logits, the
     // `used` best by probability plus the selection bias (DeepSeek V3's
     // correction, which the weights themselves leave out), and their
@@ -158,7 +158,7 @@ func _route(_ logits: gpu.Span<float32>, _ bias: gpu.Span<float32>, _ ids: gpu.M
     }
 }
 
-func _expertScale(_ y: gpu.MutableSpan<float32>, _ ids: gpu.Span<int32>, _ s: gpu.Span<float32>, _ m: int, _ items: int) kernel {
+func _expertScale(y: gpu.MutableSpan<float32>, ids: gpu.Span<int32>, s: gpu.Span<float32>, m: int, items: int) kernel {
     // Item i's row times its expert's scale: llama.cpp's *_exps_s.
     let r = gpu.Index.x
     let i = gpu.Index.y
@@ -167,7 +167,7 @@ func _expertScale(_ y: gpu.MutableSpan<float32>, _ ids: gpu.Span<int32>, _ s: gp
     }
 }
 
-func _gatedExperts(_ g: gpu.MutableSpan<float32>, _ u: gpu.Span<float32>, _ a: int32, _ gated: bool, _ limit: float32, _ n: int) kernel {
+func _gatedExperts(g: gpu.MutableSpan<float32>, u: gpu.Span<float32>, a: int32, gated: bool, limit: float32, n: int) kernel {
     // a(gate)·up, gate and up each item's row, into g -- or a(up) alone --
     // with up clamped to ±limit and a(gate) to limit where limit is set
     // (llama.cpp's swiglu_clamp_exp).
@@ -187,7 +187,7 @@ func _gatedExperts(_ g: gpu.MutableSpan<float32>, _ u: gpu.Span<float32>, _ a: i
     }
 }
 
-func _gatedFused(_ act: gpu.MutableSpan<float32>, _ gu: gpu.Span<float32>, _ a: int32, _ limit: float32, _ hidden: int, _ n: int) kernel {
+func _gatedFused(act: gpu.MutableSpan<float32>, gu: gpu.Span<float32>, a: int32, limit: float32, hidden: int, n: int) kernel {
     // a(gate)·up from one product a row: an item's gate its first hidden
     // values, its up the next (ffn_gate_up_exps), into act's row.
     let i = gpu.Index.x
@@ -204,8 +204,8 @@ func _gatedFused(_ act: gpu.MutableSpan<float32>, _ gu: gpu.Span<float32>, _ a: 
     }
 }
 
-func _combine(_ d: gpu.Span<float32>, _ w: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ dim: int, _ used: int, _ n: int,
-              _ accumulate: bool) kernel {
+func _combine(d: gpu.Span<float32>, w: gpu.Span<float32>, y: gpu.MutableSpan<float32>, dim: int, used: int, n: int,
+              accumulate: bool) kernel {
     // Token t's output: its experts' rows weighted and added, in the order
     // chosen.
     let c = gpu.Index.x
@@ -228,7 +228,7 @@ public struct Experts {
     public let Weight: tensor.Tensor
     public let Scales: gpu.Buffer<float32>?
 
-    public init(_ weight: tensor.Tensor, scales: gpu.Buffer<float32>? = nil) throws {
+    public init(weight: tensor.Tensor, scales: gpu.Buffer<float32>? = nil) throws {
         if weight.Shape.count != 3 {
             throw MoEError.unsupported("an experts' weight is [experts, rows, in], not \(weight.Shape)")
         }
@@ -242,7 +242,7 @@ public struct Experts {
 
     /// Forward writes, for each item, its expert's rows times x's row --
     /// x's row i / xShared -- into y's row i.
-    public func Forward(_ x: gpu.Buffer<float32>, ids: gpu.Buffer<int32>, items: int, xShared: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, ids: gpu.Buffer<int32>, items: int, xShared: int, into y: gpu.Buffer<float32>) async throws {
         let w = Weight.Storage
         let m = Rows, k = In, e = Count
         switch Weight.DType {
@@ -320,7 +320,7 @@ public final class MoE: nn.FFN {
 
     public var Experts: int { return Up.Count }
 
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         let d = Router.Device
         let e = Experts, k = Used
         let hidden = GateUp != nil ? Up.Rows / 2 : Up.Rows
@@ -357,7 +357,7 @@ final class _Work {
     var _have: [bool] = []
     var _ids: gpu.Buffer<int32>? = nil
 
-    func Floats(_ d: gpu.Device, _ slot: int, _ count: int) throws -> gpu.Buffer<float32> {
+    func Floats(d: gpu.Device, slot: int, count: int) throws -> gpu.Buffer<float32> {
         while _have.count <= slot {
             _have.append(false)
             _bufs.append(try d.CreateBuffer(of: float32.self, count: 1))
@@ -369,7 +369,7 @@ final class _Work {
         return _bufs[slot].Slice(from: 0, count: count)
     }
 
-    func Ids(_ d: gpu.Device, _ count: int) throws -> gpu.Buffer<int32> {
+    func Ids(d: gpu.Device, count: int) throws -> gpu.Buffer<int32> {
         if _ids == nil || _ids!.count < count {
             _ids = try d.CreateBuffer(of: int32.self, count: max(count, 1))
         }
@@ -377,7 +377,7 @@ final class _Work {
     }
 }
 
-func _gatedAdd(_ s: gpu.Span<float32>, _ g: gpu.Span<float32>, _ y: gpu.MutableSpan<float32>, _ dim: int, _ n: int, _ accumulate: bool) kernel {
+func _gatedAdd(s: gpu.Span<float32>, g: gpu.Span<float32>, y: gpu.MutableSpan<float32>, dim: int, n: int, accumulate: bool) kernel {
     // Token t's row of s times the sigmoid of its gate, into y's.
     let c = gpu.Index.x
     let t = gpu.Index.y
@@ -396,7 +396,7 @@ public final class Gated: nn.FFN {
     public let Dim: int
     let _ws: _Work
 
-    public init(_ expert: nn.FFN, gate: nn.Linear, dim: int) throws {
+    public init(expert: nn.FFN, gate: nn.Linear, dim: int) throws {
         if gate.Out != 1 {
             throw MoEError.unsupported("a shared expert's gate to \(gate.Out), not 1")
         }
@@ -406,7 +406,7 @@ public final class Gated: nn.FFN {
         self._ws = _Work()
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         let d = Gate.Device
         let s = try _ws.Floats(d, 0, n * Dim)
         try await Expert.Forward(x, rows: n, into: s, accumulate: false)

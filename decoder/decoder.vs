@@ -34,7 +34,7 @@ public enum Input {
 /// a batch's rows, attending through runs of sequences, each to its own
 /// cache for this layer.
 public protocol Block: AnyObject {
-    func Forward(_ x: gpu.Buffer<float32>, rows n: int, runs: [nn.Run]) async throws
+    func Forward(x: gpu.Buffer<float32>, rows n: int, runs: [nn.Run]) async throws
 }
 
 /// Standard is the transformer layer most decoders are, in the forms
@@ -67,7 +67,7 @@ public final class Standard: Block {
         self._ws = Workspace()
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, runs: [nn.Run]) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, runs: [nn.Run]) async throws {
         let dim = Attention.O.Out
         let d = Attention.O.Device
         let h = try _ws.Floats(d, 0, n * dim)
@@ -116,7 +116,7 @@ public final class Standard: Block {
 
     // _finish adds a branch's output to the residual stream: through its
     // post norm, if it has one, and times ResidualScale.
-    func _finish(_ b: gpu.Buffer<float32>, _ post: nn.Norm?, _ x: gpu.Buffer<float32>, _ n: int, _ dim: int) async throws {
+    func _finish(b: gpu.Buffer<float32>, post: nn.Norm?, x: gpu.Buffer<float32>, n: int, dim: int) async throws {
         if let norm = post {
             try await norm.Forward(b, rows: n, into: b)
         }
@@ -183,7 +183,7 @@ public final class Network {
     /// outputs, one after another: logits, or with hidden the final
     /// normalized hidden states. The buffer is the network's, good until
     /// the next Forward or Step.
-    public func Forward(_ input: Input, runs: [cache.Run], wanted: [int], hidden: bool = false,
+    public func Forward(input: Input, runs: [cache.Run], wanted: [int], hidden: bool = false,
                         memory: cache.KV) async throws -> gpu.Buffer<float32> {
         var n = 0
         for r in runs {
@@ -256,7 +256,7 @@ public final class Network {
         return try await _outputs(x, 1, [0], false)
     }
 
-    func _blocks(_ x: gpu.Buffer<float32>, _ n: int, _ runs: [cache.Run], _ memory: cache.KV) async throws {
+    func _blocks(x: gpu.Buffer<float32>, n: int, runs: [cache.Run], memory: cache.KV) async throws {
         for i in 0..<Blocks.count {
             var nr: [nn.Run] = []
             for r in runs {
@@ -268,7 +268,7 @@ public final class Network {
 
     // _outputs is the wanted rows of x through the final norm, and the
     // head unless hidden.
-    func _outputs(_ x: gpu.Buffer<float32>, _ n: int, _ wanted: [int], _ hidden: bool) async throws -> gpu.Buffer<float32> {
+    func _outputs(x: gpu.Buffer<float32>, n: int, wanted: [int], hidden: bool) async throws -> gpu.Buffer<float32> {
         let dim = Dim
         let w = wanted.count
         var all = w == n
@@ -300,7 +300,7 @@ public final class Network {
         return out
     }
 
-    func _ids(_ n: int) throws -> gpu.Buffer<int32> {
+    func _ids(n: int) throws -> gpu.Buffer<int32> {
         if _tokens == nil || _tokens!.count < n {
             _tokens = try Tokens(count: n)
         }
@@ -320,7 +320,7 @@ public final class Workspace {
     public init() {}
 
     /// Floats is slot's buffer, count floats long (a view of what it has).
-    public func Floats(_ d: gpu.Device, _ slot: int, _ count: int) throws -> gpu.Buffer<float32> {
+    public func Floats(d: gpu.Device, slot: int, count: int) throws -> gpu.Buffer<float32> {
         while _have.count <= slot {
             _have.append(false)
             _bufs.append(try d.CreateBuffer(of: float32.self, count: 1))

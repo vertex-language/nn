@@ -49,7 +49,7 @@ public let Names = ["QWenLMHeadModel", "qwen", "Qwen2ForCausalLM", "Qwen2Model",
                     "Qwen2MoeForCausalLM", "qwen2moe", "Qwen3MoeForCausalLM", "qwen3moe"]
 
 /// GenerationOf is the generation an architecture name is, or nil.
-public func GenerationOf(_ arch: string) -> Generation? {
+public func GenerationOf(arch: string) -> Generation? {
     switch arch {
     case "QWenLMHeadModel", "qwen": return .qwen
     case "Qwen2ForCausalLM", "Qwen2Model", "qwen2": return .qwen2
@@ -73,13 +73,13 @@ public struct Config {
     public var RopeBase: float32
 
     /// Read is a checkpoint's Qwen config.
-    public static func Read(_ ck: model.Checkpoint) throws -> Config {
+    public static func Read(ck: model.Checkpoint) throws -> Config {
         ck.Aliases = decoder.Aliases
         guard let g = GenerationOf(ck.Architecture) else {
             throw LoadError.unsupported("\(ck.Architecture) is not a Qwen")
         }
         let c = ck.Config
-        func need(_ key: string) throws -> int {
+        func need(key: string) throws -> int {
             guard let n = c.Int(key) else {
                 throw LoadError.unsupported("no \(key) in the config")
             }
@@ -104,7 +104,7 @@ public struct Config {
 }
 
 /// Load reads a Qwen checkpoint onto device d.
-public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decoder.Network {
+public func Load(ck: model.Checkpoint, on d: gpu.Device) async throws -> decoder.Network {
     let c = try Config.Read(ck)
     let w = decoder.Weights(ck, on: d)
     // Qwen's rotary embeddings turn halves of a head (NeoX's), in llama.cpp
@@ -142,7 +142,7 @@ public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decod
 // only in Qwen3's graph; a mixture of experts in the MoE generations, as
 // their graphs build it: Qwen2-MoE's weights not normalized, with a gated
 // shared expert; Qwen3-MoE's normalized, with the experts' scales.
-func _ffn(_ w: decoder.Weights, _ ck: model.Checkpoint, _ gen: Generation, _ p: string, _ g: string) async throws -> nn.FFN {
+func _ffn(w: decoder.Weights, ck: model.Checkpoint, gen: Generation, p: string, g: string) async throws -> nn.FFN {
     if gen.Experts {
         if ck.Format != .gguf {
             throw LoadError.unsupported("a mixture of experts from Hugging Face's layout is not read yet")

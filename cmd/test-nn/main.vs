@@ -13,22 +13,22 @@ import (
     "tensor"
 )
 
-@_silgen_name("exp") func cExp(_ x: float64) -> float64
+@_silgen_name("exp") func cExp(x: float64) -> float64
 
 var rng = gputest.Random(seed: 11)
 
-func floats(_ n: int, _ scale: float32 = 1) -> [float32] {
+func floats(n: int, scale: float32 = 1) -> [float32] {
     var out: [float32] = []
     for _ in 0..<n { out.append((rng.Float32() * 2 - 1) * scale) }
     return out
 }
 
-func weight(_ d: gpu.Device, _ values: [float32], _ shape: [int]) async throws -> tensor.Tensor {
+func weight(d: gpu.Device, values: [float32], shape: [int]) async throws -> tensor.Tensor {
     let b = try await d.Upload(values)
     return try tensor.Tensor(shape: shape, dtype: .F32, storage: b.View(as: uint8.self))
 }
 
-func matvec(_ w: [float32], _ x: [float32], _ out: int) -> [float64] {
+func matvec(w: [float32], x: [float32], out: int) -> [float64] {
     let n = x.count
     var y: [float64] = []
     for r in 0..<out {
@@ -39,7 +39,7 @@ func matvec(_ w: [float32], _ x: [float32], _ out: int) -> [float64] {
     return y
 }
 
-func q8Blocks(_ rows: int, _ k: int) -> ([uint8], [float32]) {
+func q8Blocks(rows: int, k: int) -> ([uint8], [float32]) {
     var bytes: [uint8] = [], dense: [float32] = []
     for _ in 0..<(rows * k / 32) {
         let d = float16(rng.Float32() * 0.02 + 0.001)
@@ -127,7 +127,7 @@ for d in gputest.Devices() {
     let positions = try await d.Upload((0..<n).map { int32($0) })
     try await neural.RoPE(qb2, positions: positions, heads: heads, dim: hd, layout: .halves)
     try await neural.RoPE(kb2, positions: positions, heads: kvHeads, dim: hd, layout: .halves)
-    func headsFirst(_ a: [float32], _ hs: int) -> [float32] {
+    func headsFirst(a: [float32], hs: int) -> [float32] {
         var out = [float32](repeating: 0, count: a.count)
         for t in 0..<n { for hh in 0..<hs { for c in 0..<hd { out[(hh * n + t) * hd + c] = a[(t * hs + hh) * hd + c] } } }
         return out

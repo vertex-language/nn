@@ -17,7 +17,7 @@ import (
 
 let file = try safetensors.Open(fs.Path("testdata/layers.safetensors"))
 
-func host(_ name: string) -> [float32] {
+func host(name: string) -> [float32] {
     guard let t = file.Tensor(name) else { fatalError("no \(name) in the fixture") }
     let p = file.Bytes(t)
     var out = [float32](repeating: 0, count: t.Count)
@@ -28,20 +28,20 @@ func host(_ name: string) -> [float32] {
     return out
 }
 
-func shape(_ name: string) -> [int] { return file.Tensor(name)!.Shape }
+func shape(name: string) -> [int] { return file.Tensor(name)!.Shape }
 
-func upload(_ d: gpu.Device, _ name: string) async throws -> gpu.Buffer<float32> {
+func upload(d: gpu.Device, name: string) async throws -> gpu.Buffer<float32> {
     return try await d.Upload(host(name))
 }
 
-func weight(_ d: gpu.Device, _ name: string) async throws -> tensor.Tensor {
+func weight(d: gpu.Device, name: string) async throws -> tensor.Tensor {
     let b = try await upload(d, name)
     return try tensor.Tensor(shape: shape(name), dtype: .F32, storage: b.View(as: uint8.self))
 }
 
 // near checks got against the fixture's want, each element within
 // tol · (1 + |want|), and says the worst error it saw.
-func near(_ what: string, _ d: gpu.Device, _ got: gpu.Buffer<float32>, _ want: string, tol: float64 = 1e-5) async throws {
+func near(what: string, d: gpu.Device, got: gpu.Buffer<float32>, want: string, tol: float64 = 1e-5) async throws {
     let g = try await got.Download()
     let w = host(want).map { float64($0) }
     var worst: float64 = 0

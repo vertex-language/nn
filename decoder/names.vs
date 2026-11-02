@@ -17,7 +17,7 @@ import (
 /// tensor_mapping.py): "model.layers.3.self_attn.q_proj.weight" is
 /// "blk.3.attn_q.weight". nil for a name outside the table: a family asks
 /// for such a tensor with its GGUF name given.
-public func GGUFName(_ hf: string) -> string? {
+public func GGUFName(hf: string) -> string? {
     var base = hf
     var suffix = ""
     for s in [".weight", ".bias"] {
@@ -98,7 +98,7 @@ public let Aliases = model.Aliases(configKeys: decoderKeys, tensorName: { GGUFNa
 
 /// Floats is a small float32 tensor's values, read on the host: a weight's
 /// scale, rope_freqs. Other dtypes are refused.
-public func Floats(_ ck: model.Checkpoint, _ t: model.TensorInfo) throws -> [float32] {
+public func Floats(ck: model.Checkpoint, t: model.TensorInfo) throws -> [float32] {
     if t.DType != tensor.DType.F32 {
         throw model.OpenError.unsupported("\(t.Name) is \(t.SourceType); a float32 tensor is read here")
     }
@@ -114,7 +114,7 @@ public func Floats(_ ck: model.Checkpoint, _ t: model.TensorInfo) throws -> [flo
 
 /// Scalar is a one-element float32 tensor's value: llama.cpp's per-weight
 /// ".scale".
-public func Scalar(_ ck: model.Checkpoint, _ t: model.TensorInfo) throws -> float32 {
+public func Scalar(ck: model.Checkpoint, t: model.TensorInfo) throws -> float32 {
     let v = try Floats(ck, t)
     if v.count != 1 {
         throw model.OpenError.unsupported("\(t.Name) holds \(v.count) values where a scale is one")
@@ -124,7 +124,7 @@ public func Scalar(_ ck: model.Checkpoint, _ t: model.TensorInfo) throws -> floa
 
 /// _suffixed is a GGUF base name with a suffix, or nil where there is no
 /// GGUF name: the Hugging Face name is read through Aliases then.
-func _suffixed(_ gg: string?, _ suffix: string) -> string? {
+func _suffixed(gg: string?, suffix: string) -> string? {
     if let g = gg {
         return g + suffix
     }
@@ -138,7 +138,7 @@ public final class Weights {
     public let Checkpoint: model.Checkpoint
     public let Device: gpu.Device
 
-    public init(_ ck: model.Checkpoint, on d: gpu.Device) {
+    public init(ck: model.Checkpoint, on d: gpu.Device) {
         self.Checkpoint = ck
         self.Device = d
     }
@@ -146,28 +146,28 @@ public final class Weights {
     /// Alloc is a buffer of count floats on the device: apart from the
     /// async readers because the compiler's SIL verifier rejects
     /// CreateBuffer specialized inside a branch of an async function.
-    public func Alloc(_ count: int) throws -> gpu.Buffer<float32> {
+    public func Alloc(count: int) throws -> gpu.Buffer<float32> {
         return try Device.CreateBuffer(of: float32.self, count: count)
     }
 
     /// Has is whether the tensor is there: hf by its Hugging Face name, or
     /// gg by its GGUF name.
-    public func Has(_ hf: string, _ gg: string? = nil) -> bool {
+    public func Has(hf: string, gg: string? = nil) -> bool {
         return Checkpoint.Has(hf, gguf: Checkpoint.Format == .gguf ? gg : nil)
     }
 
     /// Tensor is the named tensor on the device, in the file's format.
-    public func Tensor(_ hf: string, _ gg: string? = nil) async throws -> tensor.Tensor {
+    public func Tensor(hf: string, gg: string? = nil) async throws -> tensor.Tensor {
         return try await Checkpoint.Tensor(hf, gguf: Checkpoint.Format == .gguf ? gg : nil, on: Device)
     }
 
     /// Floats is the named tensor as float32 on the device.
-    public func Floats(_ hf: string, _ gg: string? = nil) async throws -> gpu.Buffer<float32> {
+    public func Floats(hf: string, gg: string? = nil) async throws -> gpu.Buffer<float32> {
         return try (try await Checkpoint.Float32(hf, gguf: Checkpoint.Format == .gguf ? gg : nil, on: Device)).Floats()
     }
 
     /// Optional is the named tensor as float32, or nil where it is not.
-    public func Optional(_ hf: string, _ gg: string? = nil) async throws -> gpu.Buffer<float32>? {
+    public func Optional(hf: string, gg: string? = nil) async throws -> gpu.Buffer<float32>? {
         if !Has(hf, gg) {
             return nil
         }
@@ -180,7 +180,7 @@ public final class Weights {
     /// bias and scale say whether the network's graph reads them: llama.cpp
     /// loads a ".scale" for every projection that has one, and each graph
     /// applies those it names.
-    public func Linear(_ base: string, _ gg: string? = nil, biasFirst: bool = false, bias useBias: bool = true,
+    public func Linear(base: string, gg: string? = nil, biasFirst: bool = false, bias useBias: bool = true,
                        scale useScale: bool = true) async throws -> nn.Linear {
         var bias: gpu.Buffer<float32>? = nil
         if useBias && Has(base + ".bias", _suffixed(gg, ".bias")) {
@@ -198,13 +198,13 @@ public final class Weights {
 
     /// RMS is the RMSNorm whose weight is base's ".weight" (and ".bias",
     /// where it has one).
-    public func RMS(_ base: string, _ eps: float32, gg: string? = nil) async throws -> nn.Norm {
+    public func RMS(base: string, eps: float32, gg: string? = nil) async throws -> nn.Norm {
         return try await Norm(.rms, base, eps, gg: gg)
     }
 
     /// Norm is the norm of kind whose weight is base's ".weight", and
     /// ".bias" where it has one.
-    public func Norm(_ kind: nn.NormKind, _ base: string, _ eps: float32, gg: string? = nil) async throws -> nn.Norm {
+    public func Norm(kind: nn.NormKind, base: string, eps: float32, gg: string? = nil) async throws -> nn.Norm {
         let weight = try await Floats(base + ".weight", _suffixed(gg, ".weight"))
         var bias: gpu.Buffer<float32>? = nil
         if Has(base + ".bias", _suffixed(gg, ".bias")) {
@@ -218,7 +218,7 @@ public final class Weights {
 /// (GGUF's attn_qkv, with its bias, or with separate Q, K and V biases)
 /// where the checkpoint has one, else the three. hf and gg are the
 /// layer's attention prefixes ("model.layers.3.self_attn.", "blk.3.").
-public func QKV(_ w: Weights, _ hf: string, _ gg: string, bias: bool = true, scale: bool = true) async throws -> [nn.Linear] {
+public func QKV(w: Weights, hf: string, gg: string, bias: bool = true, scale: bool = true) async throws -> [nn.Linear] {
     if w.Has(hf + "qkv_proj.weight", gg + "attn_qkv.weight") {
         let fused = try await w.Linear(hf + "qkv_proj", gg + "attn_qkv", bias: bias, scale: scale)
         if bias && fused.Biases[0] == nil && w.Has(hf + "q_proj.bias", gg + "attn_q.bias") {

@@ -60,13 +60,13 @@ public struct Config {
     public var TiedEmbeddings: bool
 
     /// Read is a checkpoint's llama config, asked in config.json's keys.
-    public static func Read(_ ck: model.Checkpoint) throws -> Config {
+    public static func Read(ck: model.Checkpoint) throws -> Config {
         ck.Aliases = decoder.Aliases
         if !Names.contains(ck.Architecture) {
             throw LoadError.unsupported("\(ck.Architecture) is not a llama")
         }
         let c = ck.Config
-        func need(_ key: string) throws -> int {
+        func need(key: string) throws -> int {
             guard let n = c.Int(key) else {
                 throw LoadError.unsupported("no \(key) in the config")
             }
@@ -119,7 +119,7 @@ public typealias Network = decoder.Network
 /// Load reads a llama checkpoint onto device d. Weights stay in the
 /// file's format -- f32, f16, bf16 or quantized -- and where the device
 /// reads the file's mapping in place, nothing is copied.
-public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decoder.Network {
+public func Load(ck: model.Checkpoint, on d: gpu.Device) async throws -> decoder.Network {
     let c = try Config.Read(ck)
     // llama.cpp permutes Q and K for interleaved RoPE when it writes a
     // llama GGUF; Hugging Face's weights are in halves.
@@ -156,7 +156,7 @@ public func Load(_ ck: model.Checkpoint, on d: gpu.Device) async throws -> decod
 
 // _ffn is layer p's (g's in a GGUF) MLP: Mixtral's mixture of experts
 // where the layer has a router.
-func _ffn(_ w: decoder.Weights, _ ck: model.Checkpoint, _ p: string, _ g: string) async throws -> nn.FFN {
+func _ffn(w: decoder.Weights, ck: model.Checkpoint, p: string, g: string) async throws -> nn.FFN {
     if w.Has(p + "block_sparse_moe.gate.weight", g + "ffn_gate_inp.weight") {
         return try await decoder.MixtureOf(w, g, ck, gating: .softmax, norm: true, expertScales: true, activation: .SiLU,
                                            shared: false)

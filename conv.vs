@@ -17,7 +17,7 @@ import (
     "tensor"
 )
 
-func floats(_ t: tensor.Tensor, _ what: string) throws -> gpu.Buffer<float32> {
+func floats(t: tensor.Tensor, what: string) throws -> gpu.Buffer<float32> {
     if t.DType != .F32 {
         throw LayerError.unsupported("\(what) of \(t.DType.Name); convert it to float32 first (tensor.ToF32)")
     }
@@ -50,7 +50,7 @@ public final class Dense {
     }
 
     /// Forward writes rows x Out into y from rows x In of x.
-    public func Forward(_ x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
         try await linalg.Matmul(x, Weight, into: y, linalg.Shape(m: rows, n: Out, k: In, transposeB: true),
                                 linalg.Epilogue<float32>(scale: 1, bias: Bias, residual: nil, activation: .None))
     }
@@ -102,12 +102,12 @@ public final class Conv1d {
     }
 
     /// OutLength is how long the output of length samples is.
-    public func OutLength(_ length: int) -> int {
+    public func OutLength(length: int) -> int {
         return neural.Conv1dLength(length, kernel: Kernel, stride: Stride, padding: Padding, dilation: Dilation)
     }
 
     /// Forward writes [Out, OutLength(length)] into y from [In, length].
-    public func Forward(_ x: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
         try await neural.Conv1d(x, weight: Weight, bias: Bias, into: y,
                                 neural.Conv1dShape(in: In, out: Out, length: length, kernel: Kernel, stride: Stride, padding: Padding, dilation: Dilation, groups: Groups))
     }
@@ -144,12 +144,12 @@ public final class ConvTranspose1d {
         }
     }
 
-    public func OutLength(_ length: int) -> int {
+    public func OutLength(length: int) -> int {
         return neural.ConvTranspose1dLength(length, kernel: Kernel, stride: Stride, padding: Padding, outputPadding: OutputPadding)
     }
 
     /// Forward writes [Out, OutLength(length)] into y from [In, length].
-    public func Forward(_ x: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
         try await neural.ConvTranspose1d(x, weight: Weight, bias: Bias, into: y,
                                          neural.Conv1dShape(in: In, out: Out, length: length, kernel: Kernel, stride: Stride, padding: Padding,
                                                             groups: Groups, outputPadding: OutputPadding))
@@ -216,7 +216,7 @@ public final class LSTM {
     /// Forward runs the LSTM over steps rows of x (steps x Input) from a
     /// zero state, writing steps x Out into y: the forward direction's
     /// output, then the reverse's, in each row.
-    public func Forward(_ x: gpu.Buffer<float32>, steps: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, steps: int, into y: gpu.Buffer<float32>) async throws {
         if steps == 0 {
             return
         }
@@ -266,7 +266,7 @@ public final class InstanceNorm1d {
         self.Eps = eps
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, channels: int, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, channels: int, length: int, into y: gpu.Buffer<float32>) async throws {
         try await neural.InstanceNorm(x, weight: Weight, bias: Bias, into: y, rows: channels, cols: length, eps: Eps)
     }
 }
@@ -289,7 +289,7 @@ public final class AdaIN1d {
 
     /// Forward writes [Channels, length] into y from x of that shape and
     /// the style vector (FC.In).
-    public func Forward(_ x: gpu.Buffer<float32>, style: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, style: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
         let h = try x.Device.CreateBuffer(of: float32.self, count: FC.Out)
         try await FC.Forward(style, into: h)
         try await Norm.Forward(x, channels: Channels, length: length, into: y)
@@ -311,7 +311,7 @@ public final class ChannelNorm {
         self.Eps = eps
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, channels: int, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, channels: int, length: int, into y: gpu.Buffer<float32>) async throws {
         try await neural.ChannelNorm(x, weight: Gamma, bias: Beta, into: y, rows: channels, cols: length, eps: Eps)
     }
 }
@@ -329,7 +329,7 @@ public final class AdaLayerNorm {
 
     public var Channels: int { return FC.Out / 2 }
 
-    public func Forward(_ x: gpu.Buffer<float32>, style: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, style: gpu.Buffer<float32>, length: int, into y: gpu.Buffer<float32>) async throws {
         let h = try x.Device.CreateBuffer(of: float32.self, count: FC.Out)
         try await FC.Forward(style, into: h)
         try await neural.ChannelNorm(x, weight: nil, bias: nil, into: y, rows: Channels, cols: length, eps: Eps)

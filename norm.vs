@@ -23,7 +23,7 @@ public struct Norm {
     public let Bias: gpu.Buffer<float32>?
     public let Eps: float32
 
-    public init(_ kind: NormKind, weight: gpu.Buffer<float32>, bias: gpu.Buffer<float32>? = nil, eps: float32) {
+    public init(kind: NormKind, weight: gpu.Buffer<float32>, bias: gpu.Buffer<float32>? = nil, eps: float32) {
         self.Kind = kind
         self.Weight = weight
         self.Bias = bias
@@ -31,7 +31,7 @@ public struct Norm {
     }
 
     /// Plain is a norm of count elements a row with no weight or bias.
-    public static func Plain(_ kind: NormKind, count: int, on d: gpu.Device, eps: float32) async throws -> Norm {
+    public static func Plain(kind: NormKind, count: int, on d: gpu.Device, eps: float32) async throws -> Norm {
         return Norm(kind, weight: try await d.Upload([float32](repeating: 1, count: count)), eps: eps)
     }
 
@@ -44,7 +44,7 @@ public struct Norm {
     }
 
     /// Forward normalizes rows rows of x into y.
-    public func Forward(_ x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows: int = 1, into y: gpu.Buffer<float32>) async throws {
         let cols = Count
         if Kind == .rms && Bias == nil {
             try await neural.RMSNorm(x, weight: Weight, into: y, rows: rows, cols: cols, eps: Eps)
@@ -62,7 +62,7 @@ public struct Norm {
 public protocol FFN: AnyObject {
     /// Forward writes the network's output for n rows of x into y's, or
     /// with accumulate adds it.
-    func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws
+    func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws
 }
 
 
@@ -84,7 +84,7 @@ public final class MLP: FFN {
         self._scratch = _Scratch()
     }
 
-    public func Forward(_ x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
+    public func Forward(x: gpu.Buffer<float32>, rows n: int, into y: gpu.Buffer<float32>, accumulate: bool) async throws {
         let h = try _scratch.Floats(Up.Device, n * Up.Out)
         try await Up.Forward(x, rows: n, into: h)
         try await neural.Activate(h, Activation, into: h)
